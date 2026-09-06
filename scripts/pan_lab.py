@@ -8,8 +8,9 @@ and `render_output_frame` produces every output pixel, exactly as the
 
 Two modes:
 
-  * Synthetic / hand-specified: a two-scene TRACK->TRACK plan built from
-    --from-x / --to-x / --boundary-sec (default: generated fixture).
+  * Synthetic / hand-specified: a two-scene plan built from --transition
+    (pan, zoom-in, zoom-out), --from-x / --to-x and --boundary-sec
+    (default: generated fixture, pan).
   * Replay: --plan <file> written by `autocrop --plan-json`, re-planned for
     each requested --durations value and rendered around a chosen boundary of
     the real clip given by --input.
@@ -118,22 +119,27 @@ def read_video_info(path):
 
 
 def two_scene_plan(from_center, to_center, boundary_frame, total_frames,
-                   height):
-    """Hand-built TRACK->TRACK plan in the same shape `cli()` produces."""
-    return [
-        {
-            "start_frame": 0,
-            "end_frame": boundary_frame,
-            "strategy": "TRACK",
-            "target_box": [from_center, 0, from_center, height],
-        },
-        {
-            "start_frame": boundary_frame,
-            "end_frame": total_frames,
-            "strategy": "TRACK",
-            "target_box": [to_center, 0, to_center, height],
-        },
-    ]
+                   height, transition="pan"):
+    """Hand-built two-scene plan in the same shape `cli()` produces.
+
+    transition: "pan" (TRACK->TRACK), "zoom-in" (LETTERBOX->TRACK) or
+    "zoom-out" (TRACK->LETTERBOX).
+    """
+    def track(center):
+        return {"strategy": "TRACK", "target_box": [center, 0, center, height]}
+
+    def letterbox():
+        return {"strategy": "LETTERBOX", "target_box": None}
+
+    if transition == "zoom-in":
+        first, second = letterbox(), track(to_center)
+    elif transition == "zoom-out":
+        first, second = track(from_center), letterbox()
+    else:
+        first, second = track(from_center), track(to_center)
+    first.update({"start_frame": 0, "end_frame": boundary_frame})
+    second.update({"start_frame": boundary_frame, "end_frame": total_frames})
+    return [first, second]
 
 
 def load_plan(path):
@@ -145,8 +151,8 @@ def load_plan(path):
 
 
 def pick_boundary_frame(scenes):
-    """First planned pan, else first TRACK->TRACK boundary, else first cut."""
-    for kind in ("pan", "hold"):
+    """First eased transition, else first TRACK->TRACK boundary, else first cut."""
+    for kind in ("pan", "zoom-in", "zoom-out", "hold", "layout-switch"):
         for scene in scenes[1:]:
             if scene.get("boundary_kind") == kind:
                 return scene["start_frame"]
@@ -160,16 +166,21 @@ def pick_boundary_frame(scenes):
 
 def render_variant(source_path, output_path, scenes, duration_sec,
                    width, height, fps, start_frame, end_frame):
-    """Re-plan `scenes` for one pan duration and render via production code."""
+    """Re-plan `scenes` for one duration and render via production code.
+
+    The duration is applied to pans and zooms alike so one variant answers
+    "how does this timing feel" for whichever transition the plan contains.
+    """
     plan = copy.deepcopy(scenes)
     autocrop.plan_pan_transitions(
-        None, plan, width, height, fps, pan_duration=duration_sec)
+        None, plan, width, height, fps,
+        pan_duration=duration_sec, zoom_duration=duration_sec)
     output_width, output_height = autocrop.compute_output_size(height)
 
     cap = cv2.VideoCapture(str(source_path))
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     writer = open_writer(output_path, fps, (output_width, output_height))
-    positions = []
+    regions = []
     index = autocrop.scene_index_for_frame(plan, start_frame, 0)
 
     for frame_number in range(start_frame, end_frame):
@@ -178,24 +189,27 @@ def render_variant(source_path, output_path, scenes, duration_sec,
             break
         index = autocrop.scene_index_for_frame(plan, frame_number, index)
         scene = plan[index]
-        strategy, crop_box = autocrop.resolve_frame_crop(
+        x, region_width = autocrop.resolve_frame_region(
             scene, frame_number, width, height)
         output = autocrop.render_output_frame(
             frame, scene, frame_number, width, height,
             output_width, output_height)
-        crop_x = crop_box[0] if crop_box else None
-        label = (
-            f"pan={duration_sec:.2f}s  {strategy.lower()}  "
-            f"x={'-' if crop_x is None else crop_x}"
+        kind = scene.get("boundary_kind", "start")
+        in_transition = (
+            scene.get("transition") is not None
+            and 0 <= frame_number - scene["start_frame"]
+            < scene["transition"]["duration_frames"]
         )
+        state = kind if in_transition else scene["strategy"].lower()
+        label = f"t={duration_sec:.2f}s  {state}  x={x} w={region_width}"
         cv2.putText(output, label, (14, 32), cv2.FONT_HERSHEY_SIMPLEX,
                     0.65, (255, 255, 255), 2, cv2.LINE_AA)
         writer.write(output)
-        positions.append(crop_x)
+        regions.append([x, region_width])
 
     cap.release()
     writer.release()
-    return positions, autocrop.summarize_pan_plan(plan)
+    return regions, autocrop.summarize_pan_plan(plan)
 
 
 def create_comparison(variant_paths, output_path, fps):
@@ -310,9 +324,15 @@ def main():
         "--to-x", type=float,
         help="Ending crop center in source pixels. Defaults to 75%% width.")
     parser.add_argument(
+        "--transition", choices=["pan", "zoom-in", "zoom-out"], default="pan",
+        help="Hand-built transition type (ignored with --plan). zoom-in goes "
+             "from the full letterboxed frame to a crop around --to-x; "
+             "zoom-out goes from a crop around --from-x back to full frame.")
+    parser.add_argument(
         "--durations", type=parse_durations,
         default=parse_durations("0,0.25,0.4,0.65"),
-        help="Comma-separated pan durations (default: 0,0.25,0.4,0.65).")
+        help="Comma-separated transition durations, applied to pans and zooms "
+             "(default: 0,0.25,0.4,0.65).")
     parser.add_argument(
         "--window-sec", type=float, default=1.5,
         help="Seconds retained before and after the boundary for real clips.")
@@ -349,7 +369,8 @@ def main():
         from_center = args.from_x if args.from_x is not None else width * 0.25
         to_center = args.to_x if args.to_x is not None else width * 0.75
         scenes = two_scene_plan(
-            from_center, to_center, boundary_frame, total_frames, height)
+            from_center, to_center, boundary_frame, total_frames, height,
+            transition=args.transition)
 
     if not 0 < boundary_frame < total_frames:
         raise ValueError(
@@ -367,6 +388,7 @@ def main():
     report = {
         "source": str(source_path),
         "plan": str(args.plan.resolve()) if args.plan else None,
+        "transition": None if args.plan else args.transition,
         "sourceSize": [width, height],
         "fps": fps,
         "sourceBoundarySec": boundary_sec,
@@ -378,7 +400,7 @@ def main():
     for duration in args.durations:
         label = str(duration).replace(".", "_")
         output_path = output_dir / f"pan_{label}s.mp4"
-        positions, summary = render_variant(
+        regions, summary = render_variant(
             source_path,
             output_path,
             scenes,
@@ -393,11 +415,15 @@ def main():
         report["variants"][str(duration)] = {
             "video": str(output_path),
             "planSummary": summary,
-            "cropXByFrame": positions,
+            "regionByFrame": regions,
+            "cropXByFrame": [
+                None if w >= width else x for x, w in regions],
         }
-        print(f"pan={duration:.2f}s  planned {summary['pan']} pan / "
-              f"{summary['hold']} hold / {summary['layout_switch']} layout-switch "
-              f"over {summary['track_to_track']} TRACK->TRACK boundaries")
+        print(f"t={duration:.2f}s  planned {summary['pan']} pan / "
+              f"{summary['zoom']} zoom / {summary['hold']} hold / "
+              f"{summary['layout_switch']} layout-switch over "
+              f"{summary['track_to_track']} TRACK->TRACK + "
+              f"{summary['layout_boundaries']} layout boundaries")
 
     comparison_path = output_dir / "comparison.mp4"
     contact_sheet_path = output_dir / "contact-sheet.jpg"
