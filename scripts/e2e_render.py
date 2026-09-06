@@ -116,22 +116,38 @@ def measure_output(path):
         bars.append(bar)
         # Sample inside the picture (below the top bar) to read the blue code.
         y = min(h - 1, bar + (h - 2 * bar) // 2)
-        lefts.append(int(frame[y, 0:4, 0].mean() * (W - 1) / 255))
+        # Median of a small patch: 4:2:0 chroma subsampling and the codec's
+        # deblocking make single blue samples noisy by several source pixels.
+        y0, y1 = max(0, y - 3), min(h, y + 4)
+        code = float(np.median(frame[y0:y1, 0:6, 0]))
+        lefts.append(int(round(code * (W - 1) / 255)))
     cap.release()
     return bars, lefts
 
 
-def gradual(values, expect_increasing, min_distinct, max_step):
+def gradual(values, expect_increasing, min_distinct, max_step_ratio, noise=2):
+    """Judge whether a measured trajectory eased rather than snapped.
+
+    A snap is one step covering (nearly) the whole travel; an eased
+    transition spreads it over several frames, so the largest step must stay
+    below max_step_ratio of the total travel. Measurements come from decoded
+    H.264, so backwards wiggles up to `noise` pixels are tolerated.
+    """
     distinct = len(set(values))
     steps = [b - a for a, b in zip(values, values[1:])]
     if not expect_increasing:
         steps = [-s for s in steps]
-    monotonic = all(s >= -2 for s in steps)  # tolerate 1-2px codec noise
+    travel = abs(values[-1] - values[0]) if values else 0
+    max_step = max((abs(s) for s in steps), default=0)
+    monotonic = all(s >= -noise for s in steps)
     return {
         "distinct": distinct,
-        "maxStep": max(abs(s) for s in steps) if steps else 0,
+        "travel": travel,
+        "maxStep": max_step,
+        "maxStepRatio": round(max_step / travel, 3) if travel else None,
         "monotonic": monotonic,
-        "ok": distinct >= min_distinct and monotonic and max(abs(s) for s in steps) <= max_step,
+        "ok": distinct >= min_distinct and monotonic and travel > 0
+        and max_step <= max_step_ratio * travel,
     }
 
 
@@ -221,11 +237,14 @@ def run(args):
     zin = bars[zoom_in_b - 1: zoom_in_b + zoom_frames + 1]
     zout = bars[zoom_out_b - 1: zoom_out_b + zoom_frames + 1]
     pan = lefts[pan_b - 1: pan_b + pan_frames + 1]
-    checks["zoomIn"] = dict(values=zin, **gradual(zin, False, 6, 60))
+    # Eased smoothstep peaks at 1.5x the average per-frame step, i.e. about
+    # 0.1-0.15 of the travel for these durations; a snap is ~1.0. Bar heights
+    # are exact pixel rows, the pan readback is decoded chroma (noisier).
+    checks["zoomIn"] = dict(values=zin, **gradual(zin, False, 6, 0.3))
     checks["zoomIn"]["ok"] = checks["zoomIn"]["ok"] and zin[0] > 100 and zin[-1] == 0
-    checks["zoomOut"] = dict(values=zout, **gradual(zout, True, 6, 60))
+    checks["zoomOut"] = dict(values=zout, **gradual(zout, True, 6, 0.3))
     checks["zoomOut"]["ok"] = checks["zoomOut"]["ok"] and zout[0] == 0 and zout[-1] > 100
-    checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 200))
+    checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 0.4, noise=12))
     ok = all(c["ok"] for c in checks.values())
 
     contact_sheet(fixture, rendered,
@@ -264,13 +283,13 @@ def run(args):
         f"expected 1 pan, 2 zoom, 0 layout-switch |",
         f"| zoom-in bars | {'✅' if checks['zoomIn']['ok'] else '❌'} | "
         f"{checks['zoomIn']['distinct']} distinct heights, max step "
-        f"{checks['zoomIn']['maxStep']}px: `{zin}` |",
+        f"{checks['zoomIn']['maxStep']}px ({checks['zoomIn']['maxStepRatio']} of travel): `{zin}` |",
         f"| pan crop x | {'✅' if checks['pan']['ok'] else '❌'} | "
         f"{checks['pan']['distinct']} distinct positions, max step "
-        f"{checks['pan']['maxStep']}px: `{pan}` |",
+        f"{checks['pan']['maxStep']}px ({checks['pan']['maxStepRatio']} of travel): `{pan}` |",
         f"| zoom-out bars | {'✅' if checks['zoomOut']['ok'] else '❌'} | "
         f"{checks['zoomOut']['distinct']} distinct heights, max step "
-        f"{checks['zoomOut']['maxStep']}px: `{zout}` |",
+        f"{checks['zoomOut']['maxStep']}px ({checks['zoomOut']['maxStepRatio']} of travel): `{zout}` |",
         "",
         "Artifacts: `fixture.mp4` (before), `rendered.mp4` (after), "
         "`contact-sheet.jpg`, `plan.json`, `report.json`.",
