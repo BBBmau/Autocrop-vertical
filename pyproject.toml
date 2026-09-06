@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autocrop-vertical"
-version = "1.7.0"
+version = "1.8.0"
 description = "Smart video converter using YOLOv8 + PySceneDetect to convert horizontal video to vertical 9:16 for social media."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -21,6 +21,9 @@ dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "tqdm>=4.60",
+    # Speaker focus (Light-ASD): MFCC front-end.
+    "python_speech_features>=0.6",
+    "scipy>=1.10",
 ]
 
 [project.urls]
@@ -33,4 +36,4 @@ autocrop = "main:cli"
 
 [tool.setuptools]
 # main.py lives at the repo root; treat it as a single top-level module.
-py-modules = ["main", "speaker"]
+py-modules = ["main", "speaker", "asd"]

@@ -33,12 +33,35 @@ autocrop -i in.mp4 -o out.mp4 --speaker-focus auto --speaker-min-dwell 1.2 \
   --debug-overlay overlay.mp4 --plan-json plan.json
 ```
 
-`speaker.py` tracks faces per frame in multi-person scenes, turns per-track
-speaking scores into speaker turns (with dwell/hysteresis) and splits the
-scene into sub-scenes the pan/zoom planner eases between. The scorer is the
-`speaker.score_speaking(video_path, scene, tracks, fps)` hook: return
-`{track_id: per-frame scores in [0, 1]}` or `None`. Face weights are fetched
-once to `~/.cache/autocrop/` (override with `AUTOCROP_FACE_MODEL=/path.onnx`).
+`speaker.py` tracks faces per frame in multi-person scenes (OpenCV YuNet),
+`asd.py` scores each face per frame with **Light-ASD** (audio-visual active
+speaker detection: does this mouth match the audio?), and the scores become
+speaker turns (dwell + hysteresis) that split the scene into sub-scenes the
+pan/zoom planner eases between. When several people talk at once the frame
+follows the face whose speech dominates the audio (`--speaker-overlap
+loudest`, default) or widens to the group (`group`). A lone face among
+several YOLO bodies (audience, bystanders) is tracked when it is the one
+talking instead of letterboxing everyone. Scenes keep their scene-level
+framing when there is no audio stream or the speaker extras are missing.
+
+Requirements: `torch` (CPU is fine, ~1s per 6s of one face), `python_speech_features`,
+`scipy`, `ffmpeg`. Model weights (YuNet 0.2MB, Light-ASD 4MB) are fetched
+once to `~/.cache/autocrop/` and checksum-verified (override with
+`AUTOCROP_FACE_MODEL` / `AUTOCROP_ASD_MODEL`).
+
+**Accuracy on real footage** — `scripts/speaker_eval.py` turns clips into a
+labelled eval set and scores the pipeline against it:
+
+```bash
+# 1. draft labels + a review video (tracks, scores, chosen speaker) per clip
+python scripts/speaker_eval.py prefill clip.mp4 --labels clip.json --review clip_review.mp4
+# 2. watch the review video, fix `speaker` x/y (frame fractions) or null, drop "draft"
+# 3. gate: accuracy over labelled speech frames; drafts only report
+python scripts/speaker_eval.py evaluate-set eval-set/ --min-accuracy 0.85
+```
+
+CI downloads the `eval-set-v1` release asset (public-domain NASA briefing
+clips, 6–7 faces at the table) and publishes the table in the job summary.
 
 ### Render E2E (CI)
 
@@ -55,9 +78,13 @@ files as the `autocrop-e2e-<sha>` artifact; `viral-clip-extractor` runs the
 same script at its pinned ref before every deploy.
 
 ```bash
-pip install opencv-python-headless "scenedetect[opencv]" numpy tqdm
+pip install opencv-python-headless "scenedetect[opencv]" numpy tqdm python_speech_features scipy
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 python3 scripts/e2e_render.py --output-dir autocrop-e2e
 ```
+
+The speaker case also smoke-tests the real Light-ASD model (weights, MFCC,
+crops, 25fps resampling, inference) on the fixture's synthetic audio track.
 
 ### Local Pan Lab
 
@@ -271,6 +298,15 @@ This script is built on a pipeline that uses specialized libraries for each step
 ---
 
 ### Changelog
+
+#### v1.8.0 — Speaker focus: audio-visual speaker scoring (phase 2)
+
+*   **Light-ASD scorer** (`asd.py`, MIT, ~1M params, CPU): `speaker.score_speaking` now returns real per-frame P(speaking) per face track. Audio is pulled per scene with ffmpeg (16kHz mono), MFCC'd at 100Hz; each track's face crops are resampled to 25fps and scored in 6s chunks. Digital silence and off-screen frames are forced to 0. ~1s per 6s of one face on a laptop CPU; a 20s clip with a 7-face wide shot renders in ~14s end to end.
+*   **`--speaker-overlap loudest|group`** (default `loudest`): during crosstalk the frame follows the face whose speech best matches the audio instead of widening to the group. Flapping leads never move the frame (dwell still applies).
+*   **Lone speaking face**: a scene YOLO letterboxed because it saw several bodies (audience heads, bystanders) but with exactly one face track is switched to TRACK on that face when it is speaking ≥50% of its on-screen time. A silent lone face keeps the letterbox (e.g. b-roll with narration).
+*   **Real-footage eval** (`scripts/speaker_eval.py`): `prefill` drafts a labelled speaker timeline + review video per clip, `evaluate`/`evaluate-set` score the pipeline against labels (accuracy over labelled speech frames, wrong-face/missed counts, switch counts). CI runs it on the `eval-set-v1` release asset; draft labels report only, verified labels gate at `--min-accuracy`.
+*   **E2E**: fixtures now carry an audio track; the speaker case smoke-tests the real model and pins the `group` policy so the widen/narrow path stays covered. `test_asd.py` covers crops, 30→25fps resampling, padding and the silence gate.
+*   Dependencies: `python_speech_features`, `scipy` (torch was already required by YOLO).
 
 #### v1.7.0 — Speaker focus foundation (phase 1)
 

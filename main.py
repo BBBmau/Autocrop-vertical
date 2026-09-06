@@ -945,14 +945,20 @@ def cli():
                              "switches (LETTERBOX<->TRACK). Defaults to "
                              "--pan-duration. Set to 0 for instant layout switches.")
     parser.add_argument('--speaker-focus', type=str, default='off', choices=['off', 'auto'],
-                        help="In scenes with 2+ people, track faces per frame and split the "
-                             "scene at speaker turns so the crop pans to whoever is talking "
-                             "(default off). 'auto' needs a speaker scorer; until one is "
-                             "installed multi-person scenes keep their scene-level framing.")
+                        help="In scenes with 2+ people, track faces per frame, score who is "
+                             "speaking (Light-ASD, audio-visual) and split the scene at "
+                             "speaker turns so the crop pans to whoever is talking (default "
+                             "off). Needs torch + python_speech_features and an audio track; "
+                             "otherwise multi-person scenes keep their scene-level framing.")
     parser.add_argument('--speaker-min-dwell', type=float, default=1.2,
                         help="Seconds a new speaker must hold the floor before the frame "
                              "follows them, and the minimum time spent on a speaker "
                              "(default 1.2). Higher = calmer framing, slower to follow.")
+    parser.add_argument('--speaker-overlap', type=str, default='loudest',
+                        choices=['loudest', 'group'],
+                        help="When several people talk at once: 'loudest' (default) "
+                             "frames the face whose speech best matches the audio; "
+                             "'group' widens to everyone until one speaker is clear.")
     parser.add_argument('--speaker-face-stride', type=int, default=2,
                         help="Run face detection every N frames when tracking speakers "
                              "(default 2). Higher = cheaper, coarser tracks.")
@@ -1114,7 +1120,8 @@ def cli():
         scenes_analysis, speaker_debug = speaker.apply_speaker_focus(
             input_video, scenes_analysis, fps, original_height, decide,
             min_dwell_sec=args.speaker_min_dwell,
-            face_stride=args.speaker_face_stride)
+            face_stride=args.speaker_face_stride,
+            overlap=args.speaker_overlap)
     plan_pan_transitions(
         input_video,
         scenes_analysis,

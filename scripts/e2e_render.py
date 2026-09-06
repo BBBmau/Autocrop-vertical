@@ -41,6 +41,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+import asd  # noqa: E402
 import main as autocrop  # noqa: E402
 import speaker  # noqa: E402
 
@@ -108,9 +109,16 @@ def make_fixture(path, fps, scenes, label):
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (235, 235, 235), 2, cv2.LINE_AA)
         writer.write(frame)
     writer.release()
+    # Add a synthetic voice-like audio track (tone bursts) so the audio mux path
+    # and the Light-ASD feature extraction run on real streams in CI.
+    duration = scenes[-1][1]
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", str(path)],
+         "-f", "lavfi", "-t", str(duration),
+         "-i", "sine=frequency=220:sample_rate=16000,tremolo=f=4:d=0.9,volume=0.4",
+         "-map", "0:v", "-map", "1:a", "-shortest",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
+         "-c:a", "aac", "-b:a", "64k", str(path)],
         check=True)
     raw.unlink()
     return total
@@ -135,7 +143,7 @@ def fake_track_faces_for(scenes):
     return fake_track_faces
 
 
-def fake_score_speaking(video_path, scene, tracks, fps):
+def fake_score_speaking(video_path, scene, tracks, fps, log=None):
     length = scene["end_frame"] - scene["start_frame"]
     scores = {t["id"]: np.zeros(length) for t in tracks}
     for start, end, ids in SPEAKER_SCRIPT:
@@ -357,12 +365,42 @@ def run_speaker(out_dir, args):
     except Exception as exc:  # noqa: BLE001
         checks["faceDetector"] = {"ok": False, "error": repr(exc)}
 
+    # Smoke-test the real Light-ASD path on the fixture: weights download, MFCC,
+    # crops, resampling and inference. Drawn faces carry no lip motion, so we
+    # only check shapes, range and runtime — accuracy is measured on real
+    # footage by scripts/speaker_eval.py.
+    import time
+    scene = {"start_frame": 0, "end_frame": total_frames,
+             "start_seconds": 0.0, "end_seconds": total_frames / fps}
+    tracks = fake_track_faces_for(SPEAKER_SCENES)(str(fixture), 0, total_frames, fps)
+    try:
+        t0 = time.time()
+        real = speaker.score_speaking(str(fixture), scene, tracks, fps)
+        elapsed = time.time() - t0
+        if real is None:
+            checks["asdModel"] = {"ok": False, "error": "score_speaking returned None "
+                                  "(torch/python_speech_features missing or no audio)"}
+        else:
+            arrays = [np.asarray(real[t["id"]]) for t in tracks]
+            checks["asdModel"] = {
+                "ok": all(a.shape == (total_frames,) for a in arrays)
+                and all(np.all((a >= 0) & (a <= 1)) for a in arrays),
+                "seconds": round(elapsed, 2),
+                "meanScores": [round(float(a.mean()), 3) for a in arrays],
+                "model": asd.model_path(),
+            }
+    except Exception as exc:  # noqa: BLE001
+        checks["asdModel"] = {"ok": False, "error": repr(exc)}
+
     autocrop.analyze_scene_content = fake_analyze_for(SPEAKER_SCENES)
     speaker.track_faces = fake_track_faces_for(SPEAKER_SCENES)
     speaker.score_speaking = fake_score_speaking
     plan = run_cli(fixture, rendered, plan_path, args, [
         "--speaker-focus", "auto",
         "--speaker-min-dwell", str(SPEAKER_DWELL_SEC),
+        # 'group' so the fixture exercises the widen/narrow (zoom) path too;
+        # the production default 'loudest' is covered by unit tests.
+        "--speaker-overlap", "group",
         "--debug-overlay", str(overlay),
     ])
     summary = plan["summary"]
@@ -423,7 +461,8 @@ def run_speaker(out_dir, args):
         f"### speaker focus — {'PASS' if ok else 'FAIL'}",
         "",
         f"One scene, two people, scripted speaking: A 0-3s (B interjects 1.5-1.8s), "
-        f"B 3-5.5s, crosstalk 5.5-6.8s, A 6.8-8s; dwell {SPEAKER_DWELL_SEC}s. "
+        f"B 3-5.5s, crosstalk 5.5-6.8s, A 6.8-8s; dwell {SPEAKER_DWELL_SEC}s, "
+        f"overlap policy `group` (scripted scores; real Light-ASD smoke-tested separately). "
         f"Plan: `{summary.get('speaker_turns')} speaker-turns, {summary.get('pan')} pan / "
         f"{summary.get('zoom')} zoom`.",
         "",
@@ -431,6 +470,8 @@ def run_speaker(out_dir, args):
         "|---|---|---|",
         f"| face detector | {mark(checks['faceDetector']['ok'])} | "
         f"{checks['faceDetector'].get('error') or 'YuNet loaded, 0 faces on blank frame'} |",
+        f"| Light-ASD | {mark(checks['asdModel']['ok'])} | "
+        f"{checks['asdModel'].get('error') or ('scored ' + str(len(checks['asdModel']['meanScores'])) + ' tracks x ' + str(total_frames) + ' frames in ' + str(checks['asdModel']['seconds']) + 's; mean P(speaking) ' + str(checks['asdModel']['meanScores']))} |",
         f"| frame count | {mark(checks['frameCount']['ok'])} | "
         f"{checks['frameCount']['actual']} / {checks['frameCount']['expected']} |",
         f"| segments | {mark(checks['segments']['ok'])} | {speakers} (expected {expected_speakers}) |",

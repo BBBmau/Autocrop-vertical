@@ -19,6 +19,8 @@ only for scenes where the scene-level analysis already found >= 2 people.
 import os
 import urllib.request
 
+import numpy as np
+
 FACE_MODEL_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
                   "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 FACE_MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
@@ -220,15 +222,65 @@ def median_box(track, start_frame, end_frame):
     return [int(round(v)) for v in np.median(arr, axis=0)]
 
 
-def score_speaking(video_path, scene, tracks, fps):
-    """Hook for the audio-visual active speaker model (phase 2).
+SILENCE_RMS = 0.002  # below this (of full scale) nobody can be "speaking"
 
-    Must return {track_id: sequence of per-frame scores in [0, 1]} aligned to
-    scene['start_frame']..scene['end_frame'], or None when no scorer is
-    available. Phase 1 has no scorer, so speaker focus keeps every scene as
-    the scene-level analysis framed it.
+
+def score_speaking(video_path, scene, tracks, fps, log=None):
+    """Per-track P(speaking) per frame from Light-ASD (see asd.py).
+
+    Returns {track_id: np.array over scene['start_frame']..scene['end_frame']}
+    or None when scoring is impossible (no torch/python_speech_features, no
+    audio stream), in which case the scene keeps its scene-level framing.
+    Reads the scene's frames a second time to build 112x112 face crops for
+    every track; detection itself already happened in track_faces.
     """
-    return None
+    import cv2
+    import asd
+    if not asd.available():
+        if log:
+            log("   speaker-focus: torch/python_speech_features not installed; "
+                "install them to enable speaker scoring")
+        return None
+    start, end = scene["start_frame"], scene["end_frame"]
+    audio = asd.extract_audio(video_path, scene["start_seconds"], scene["end_seconds"])
+    if audio is None or len(audio) < asd.AUDIO_RATE // 10:
+        if log:
+            log("   speaker-focus: no audio stream; cannot score speakers")
+        return None
+    model = asd.get_model()
+    mfcc = asd.mfcc_features(audio)
+
+    crops = {t["id"]: {} for t in tracks}
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+    n = start
+    while n < end:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        gray = None
+        for track in tracks:
+            box = track["boxes"].get(n)
+            if box is None:
+                continue
+            if gray is None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            crops[track["id"]][n] = asd.crop_face(gray, box)
+        n += 1
+    cap.release()
+
+    energy = asd.audio_energy_by_frame(audio, start, end, fps)
+    silent = energy < SILENCE_RMS
+    scores = {}
+    for track in tracks:
+        probs = asd.score_track_crops(model, mfcc, crops[track["id"]], start, end, fps)
+        probs = np.asarray(probs, dtype=float)
+        probs[silent[:len(probs)]] = 0.0
+        # A face that is not on screen cannot be the speaker we frame.
+        present = np.array([(start + i) in track["boxes"] for i in range(len(probs))])
+        probs[~present] = 0.0
+        scores[track["id"]] = probs
+    return scores
 
 
 def _smooth(values, window):
@@ -244,14 +296,16 @@ def _smooth(values, window):
 
 def segment_speaker_turns(scores, start_frame, end_frame, fps,
                           min_dwell_sec=1.2, on_threshold=0.5, margin=0.15,
-                          smooth_sec=0.3):
+                          smooth_sec=0.3, overlap="loudest"):
     """Turn per-track speaking scores into speaker segments.
 
     Per frame the candidate is:
       - the top-scoring track when it is >= on_threshold and beats the
         runner-up by `margin` ("one clear speaker"),
-      - 'group' when two or more tracks are >= on_threshold without a clear
-        winner (crosstalk),
+      - during crosstalk (two or more tracks >= on_threshold, no clear
+        winner): the top-scoring track when overlap='loudest' — the face
+        whose mouth best matches the dominant audio — or 'group' when
+        overlap='group',
       - None when nobody is speaking (hold whatever was framed).
     A candidate has to persist for min_dwell_sec before the framing follows
     it, and a new segment lasts at least min_dwell_sec; interjections shorter
@@ -283,7 +337,7 @@ def segment_speaker_turns(scores, start_frame, end_frame, fps,
         second = col[order[1]] if len(order) > 1 else 0.0
         if top_score < on_threshold:
             candidates.append((None, 0.0))
-        elif second >= on_threshold and top_score - second < margin:
+        elif second >= on_threshold and top_score - second < margin and overlap == "group":
             candidates.append(("group", float(top_score)))
         else:
             candidates.append((ids[top], float(top_score - second)))
@@ -362,9 +416,21 @@ def split_scene_by_speaker(scene, segments, tracks, frame_height,
     return out
 
 
+SINGLE_FACE_SPEAKING_MIN = 0.5   # share of on-screen frames a lone face must be talking
+
+
+def _speaking_fraction(scores, track, start_frame, on_threshold=0.5):
+    """Share of frames where the track is on screen and scored as speaking."""
+    probs = np.asarray(scores.get(track["id"], []), dtype=float)
+    present = np.array([(start_frame + i) in track["boxes"] for i in range(len(probs))])
+    if not present.any():
+        return 0.0
+    return float(np.mean(probs[present] >= on_threshold))
+
+
 def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                         decide_strategy, min_dwell_sec=1.2, face_stride=2,
-                        log=print):
+                        overlap="loudest", log=print):
     """Run tracking + scoring on multi-person scenes and split them by speaker.
 
     Returns (new_scenes_analysis, debug) where debug maps original scene
@@ -378,6 +444,30 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
             continue
         tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
                              fps, face_stride=face_stride)
+        if len(tracks) == 1 and scene.get("strategy") == "LETTERBOX":
+            # Several bodies (audience, bystanders) but one face: if that face
+            # is doing the talking, frame it instead of letterboxing everyone.
+            scores = score_speaking(video_path, scene, tracks, fps, log=log)
+            track = tracks[0]
+            fraction = _speaking_fraction(scores, track, scene["start_frame"]) if scores else None
+            debug[idx] = {"tracks": tracks, "scores": scores or None, "segments": None,
+                          "start_frame": scene["start_frame"]}
+            if fraction is not None and fraction >= SINGLE_FACE_SPEAKING_MIN:
+                scene["strategy"] = "TRACK"
+                scene["target_box"] = median_box(track, scene["start_frame"], scene["end_frame"])
+                scene["speaker"] = {"kind": "track", "track_id": track["id"],
+                                    "confidence": round(fraction, 3),
+                                    "reason": "single-speaking-face"}
+                log(f"   speaker-focus: scene {idx + 1} has {people} people, one face "
+                    f"speaking {fraction:.0%} of the time -> TRACK that face")
+            else:
+                why = "no-scorer" if fraction is None else f"speaking {fraction:.0%}"
+                scene["speaker"] = {"kind": "unsplit", "reason": "faces", "tracks": 1,
+                                    "detail": why}
+                log(f"   speaker-focus: scene {idx + 1} has {people} people but one face "
+                    f"track ({why}); keeping scene-level framing")
+            out.append(scene)
+            continue
         if len(tracks) < 2:
             log(f"   speaker-focus: scene {idx + 1} has {people} people but "
                 f"{len(tracks)} face track(s); keeping scene-level framing")
@@ -386,10 +476,10 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
             debug[idx] = {"tracks": tracks, "scores": None, "segments": None,
                           "start_frame": scene["start_frame"]}
             continue
-        scores = score_speaking(video_path, scene, tracks, fps)
+        scores = score_speaking(video_path, scene, tracks, fps, log=log)
         if not scores:
             log(f"   speaker-focus: scene {idx + 1} tracked {len(tracks)} faces "
-                f"but no speaker scorer is available; keeping scene-level framing")
+                f"but could not score speakers; keeping scene-level framing")
             scene["speaker"] = {"kind": "unsplit", "reason": "no-scorer", "tracks": len(tracks)}
             out.append(scene)
             debug[idx] = {"tracks": tracks, "scores": None, "segments": None,
@@ -397,7 +487,8 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
             continue
         segments = segment_speaker_turns(scores, scene["start_frame"],
                                          scene["end_frame"], fps,
-                                         min_dwell_sec=min_dwell_sec)
+                                         min_dwell_sec=min_dwell_sec,
+                                         overlap=overlap)
         subs = split_scene_by_speaker(scene, segments, tracks, frame_height,
                                       decide_strategy)
         log(f"   speaker-focus: scene {idx + 1} -> {len(subs)} segment(s) from "
