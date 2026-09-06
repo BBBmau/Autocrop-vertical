@@ -24,26 +24,50 @@ jobs:
       - name: Install ffmpeg
         run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
 
-      # The E2E stubs YOLO, so ultralytics/torch are not installed here. It
-      # still runs real scene detection, planning and the ffmpeg encode loop.
+      # The E2E stubs YOLO, so ultralytics is not installed here. It still runs
+      # real scene detection, planning, the ffmpeg encode loop and the real
+      # Light-ASD speaker model (CPU torch).
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install "opencv-python-headless>=4.8,<5.0" \
-            "scenedetect[opencv]>=0.6,<0.7" "numpy" "tqdm>=4.60"
+            "scenedetect[opencv]>=0.6,<0.7" "numpy" "tqdm>=4.60" \
+            "python_speech_features>=0.6" "scipy>=1.10"
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Cache speaker models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/autocrop
+          key: autocrop-models-${{ hashFiles('speaker.py', 'asd.py') }}
 
       - name: Unit tests
-        run: python -m unittest -v test_main test_speaker
+        run: python -m unittest -v test_main test_speaker test_asd
 
       - name: Render E2E (before/after fixture)
         id: e2e
         run: python scripts/e2e_render.py --output-dir autocrop-e2e
+
+      # Real footage: public-domain NASA briefing clips with a labelled speaker
+      # timeline (release asset eval-set-v1). Draft labels only report; once
+      # labels are verified the step fails below --min-accuracy.
+      - name: Speaker focus accuracy on real footage
+        run: |
+          curl -sSL -o eval-set.tar.gz \
+            "https://github.com/${{ github.repository }}/releases/download/eval-set-v1/speaker-eval-set-v1.tar.gz"
+          mkdir -p eval-set && tar -xzf eval-set.tar.gz -C eval-set
+          python scripts/speaker_eval.py evaluate-set eval-set \
+            --report autocrop-e2e/speaker-eval.json --min-accuracy 0.85 \
+            2> >(grep -v "Detected:" >&2) | tee autocrop-e2e/speaker-eval.md
 
       - name: Publish E2E summary
         if: always()
         run: |
           if [ -f autocrop-e2e/summary.md ]; then
             cat autocrop-e2e/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f autocrop-e2e/speaker-eval.md ]; then
+            { echo; echo "## Speaker focus on real footage"; echo; cat autocrop-e2e/speaker-eval.md; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload before/after videos

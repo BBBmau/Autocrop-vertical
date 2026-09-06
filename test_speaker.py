@@ -43,12 +43,31 @@ class SpeakerTurnSegmentation(unittest.TestCase):
         self.assertEqual(segs[1]["start_frame"], 120)
         self.assertEqual(segs[-1]["end_frame"], 240)
 
-    def test_sustained_crosstalk_becomes_group(self):
+    def test_sustained_crosstalk_becomes_group_with_group_policy(self):
+        segs = speaker.segment_speaker_turns(
+            scores(300, t0=[(0, 100), (100, 200, 0.8), (200, 300)],
+                   t1=[(100, 200, 0.85)]), 0, 300, FPS,
+            min_dwell_sec=1.0, smooth_sec=0, overlap="group")
+        self.assertEqual([s["speaker"] for s in segs], [0, "group", 0])
+
+    def test_crosstalk_follows_the_louder_face_by_default(self):
         segs = speaker.segment_speaker_turns(
             scores(300, t0=[(0, 100), (100, 200, 0.8), (200, 300)],
                    t1=[(100, 200, 0.85)]), 0, 300, FPS,
             min_dwell_sec=1.0, smooth_sec=0)
-        self.assertEqual([s["speaker"] for s in segs], [0, "group", 0])
+        self.assertEqual([s["speaker"] for s in segs], [0, 1, 0])
+        self.assertEqual(segs[1]["start_frame"], 100)
+
+    def test_flapping_crosstalk_does_not_move_the_frame(self):
+        # Scores trade the lead every 5 frames; no candidate persists for the
+        # dwell, so the frame stays on the original speaker.
+        a = np.full(300, 0.9)
+        b = np.zeros(300)
+        for k in range(100, 200, 10):
+            b[k:k + 5] = 0.95
+        segs = speaker.segment_speaker_turns({0: a, 1: b}, 0, 300, FPS,
+                                             min_dwell_sec=1.0, smooth_sec=0)
+        self.assertEqual([s["speaker"] for s in segs], [0])
 
     def test_silence_holds_current_speaker(self):
         segs = speaker.segment_speaker_turns(
@@ -212,6 +231,42 @@ class SceneSplitting(unittest.TestCase):
             speaker.track_faces, speaker.score_speaking = original
         self.assertEqual([s["speaker"]["track_id"] for s in out], [0, 1])
         self.assertEqual(out[1]["boundary_source"], "speaker-turn")
+
+    def test_lone_speaking_face_among_bystanders_is_tracked(self):
+        # YOLO saw 2 bodies -> LETTERBOX, but only one face exists and it talks.
+        scene = self.scene()
+        scene["strategy"], scene["target_box"] = "LETTERBOX", None
+        track = self.tracks()[0]
+        original = (speaker.track_faces, speaker.score_speaking)
+        speaker.track_faces = lambda *a, **k: [track]
+        speaker.score_speaking = lambda *a, **k: scores(240, t0=[(0, 200)])
+        try:
+            out, debug = speaker.apply_speaker_focus(
+                "unused.mp4", [scene], FPS, 720, lambda a, h: ("LETTERBOX", None),
+                log=lambda *_: None)
+        finally:
+            speaker.track_faces, speaker.score_speaking = original
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["strategy"], "TRACK")
+        self.assertEqual(out[0]["speaker"]["reason"], "single-speaking-face")
+        self.assertEqual(out[0]["target_box"], speaker.median_box(track, 0, 240))
+        self.assertIsNotNone(debug[0]["scores"])
+
+    def test_lone_silent_face_keeps_letterbox(self):
+        scene = self.scene()
+        scene["strategy"], scene["target_box"] = "LETTERBOX", None
+        track = self.tracks()[0]
+        original = (speaker.track_faces, speaker.score_speaking)
+        speaker.track_faces = lambda *a, **k: [track]
+        speaker.score_speaking = lambda *a, **k: scores(240, t0=[(0, 40)])
+        try:
+            out, _ = speaker.apply_speaker_focus(
+                "unused.mp4", [scene], FPS, 720, lambda a, h: ("LETTERBOX", None),
+                log=lambda *_: None)
+        finally:
+            speaker.track_faces, speaker.score_speaking = original
+        self.assertEqual(out[0]["strategy"], "LETTERBOX")
+        self.assertEqual(out[0]["speaker"]["kind"], "unsplit")
 
     def test_single_person_scenes_are_untouched(self):
         scene = self.scene()
