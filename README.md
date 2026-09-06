@@ -256,7 +256,11 @@ This script is built on a pipeline that uses specialized libraries for each step
 
 ### Changelog
 
-#### v1.6.0 — Smooth zooms between letterbox and tracked crops
+#### v1.6.1 — Render E2E hardening
+
+*   **CI-only change.** `scripts/e2e_render.py` judges pans/zooms by the largest per-frame step relative to total travel (a snap is 1.0, an eased transition ≈0.15) and reads crop position from a median patch, so decoded 4:2:0 chroma noise on Linux ffmpeg builds no longer produces false failures. Artifact names are safe for PR runs.
+
+### v1.6.0 — Smooth zooms between letterbox and tracked crops
 
 *   **LETTERBOX↔TRACK layout switches now ease** over `--zoom-duration` (default: same as `--pan-duration`). Going from the whole stream to a subject is a zoom-in whose source region shrinks from the full frame to the crop while its centre converges on the subject; going back is the reverse. Previously these boundaries swapped layouts in a single frame, which read as a jump cut even when pans were smooth.
 *   **One framing model.** Every output frame is now a full-height source region `(x, w)` scaled to the output width and letterboxed if wider than the output aspect. TRACK, LETTERBOX, pans and zooms are all the same `render_region` call, so nothing can drift between them.

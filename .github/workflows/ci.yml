@@ -50,7 +50,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autocrop-e2e-${{ github.sha }}
+          name: autocrop-e2e-${{ github.run_id }}
           path: |
             autocrop-e2e/fixture.mp4
             autocrop-e2e/rendered.mp4
