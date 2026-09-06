@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests + render E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      # The E2E stubs YOLO, so ultralytics/torch are not installed here. It
+      # still runs real scene detection, planning and the ffmpeg encode loop.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "opencv-python-headless>=4.8,<5.0" \
+            "scenedetect[opencv]>=0.6,<0.7" "numpy" "tqdm>=4.60"
+
+      - name: Unit tests
+        run: python -m unittest -v test_main
+
+      - name: Render E2E (before/after fixture)
+        id: e2e
+        run: python scripts/e2e_render.py --output-dir autocrop-e2e
+
+      - name: Publish E2E summary
+        if: always()
+        run: |
+          if [ -f autocrop-e2e/summary.md ]; then
+            cat autocrop-e2e/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload before/after videos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autocrop-e2e-${{ github.sha }}
+          path: |
+            autocrop-e2e/fixture.mp4
+            autocrop-e2e/rendered.mp4
+            autocrop-e2e/contact-sheet.jpg
+            autocrop-e2e/plan.json
+            autocrop-e2e/report.json
+            autocrop-e2e/summary.md
+          if-no-files-found: warn
+          retention-days: 30

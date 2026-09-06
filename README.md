@@ -26,17 +26,38 @@ The `yolov8n.pt` model weights are downloaded automatically on first run.
 
 ---
 
+### Render E2E (CI)
+
+`scripts/e2e_render.py` is the release gate. It builds a synthetic H.264
+fixture (wide shot → speaker left → speaker right → wide shot), runs the real
+`autocrop` CLI on it with only YOLO detection stubbed, and asserts that the
+rendered output zooms in, pans, and zooms out gradually instead of snapping.
+It writes `fixture.mp4` (before), `rendered.mp4` (after), a `contact-sheet.jpg`
+of source-vs-output frames around each boundary, `plan.json`, `report.json`
+and `summary.md`. The `CI` workflow runs it on every PR and uploads those
+files as the `autocrop-e2e-<sha>` artifact; `viral-clip-extractor` runs the
+same script at its pinned ref before every deploy.
+
+```bash
+pip install opencv-python-headless "scenedetect[opencv]" numpy tqdm
+python3 scripts/e2e_render.py --output-dir autocrop-e2e
+```
+
 ### Local Pan Lab
 
 Use the lightweight pan lab when iterating on transition timing. It skips
 YOLO and scene detection but then runs the production code: the same
-`plan_pan_transitions` decides where pans happen and the same
+`plan_pan_transitions` decides where pans and zooms happen and the same
 `render_output_frame` produces every pixel that the `autocrop` CLI writes.
 It renders four durations side by side and creates a contact sheet.
 
 ```bash
 # First run creates .pan-lab-venv with only OpenCV + NumPy.
 ./scripts/pan-lab
+
+# Zoom from the full letterboxed frame onto a subject (or back out).
+./scripts/pan-lab --transition zoom-in
+./scripts/pan-lab --transition zoom-out
 
 # Hand-specify a transition on a real clip without rendering all of it.
 ./scripts/pan-lab \
@@ -52,16 +73,17 @@ python3 main.py -i source.mp4 -o /dev/null --plan-only --plan-json plan.json
 ./scripts/pan-lab --input source.mp4 --plan plan.json --durations 0,0.3,0.4,0.6
 ```
 
-With `--plan`, the boundary defaults to the first planned pan; pass
-`--boundary-sec` to inspect a different one. `report.json` records the
-transition summary (`pan / hold / layout-switch`) for every variant, so a
-plan that yields zero pans is visible immediately.
+With `--plan`, the boundary defaults to the first planned transition; pass
+`--boundary-sec` to inspect a different one. Each `--durations` value is
+applied to pans and zooms alike. `report.json` records the transition
+summary (`pan / zoom / hold / layout-switch`) for every variant, so a plan
+that yields zero transitions is visible immediately.
 
 Artifacts are written to `pan-lab-output/`:
 
 - `comparison.mp4` — all timing variants playing together
 - `contact-sheet.jpg` — transition frames aligned by timestamp
-- `report.json` — exact crop x-position for every rendered frame
+- `report.json` — exact source region `[x, w]` for every rendered frame
 - `pan_*s.mp4` — individual variants
 
 For real clips, the lab renders only 1.5 seconds on either side of the
@@ -129,7 +151,8 @@ python3 main.py -i video.mp4 -o vertical.mp4 --frame-skip 0
 |------|---------|-------------|
 | `--frame-skip` | `0` | Frames to skip during scene detection. `0` = every frame (most accurate). `1` = every other frame (~2x faster). Higher = faster but may miss cuts |
 | `--downscale` | `0` (auto) | Downscale factor for scene detection. `0` = auto. `2`-`4` = faster but may miss subtle cuts |
-| `--pan-duration` | `0.4` | Seconds used for an eased pan when the TRACK crop center jumps (including speaker switches). `0` disables panning. LETTERBOX layout switches stay instant |
+| `--pan-duration` | `0.4` | Seconds used for an eased pan when the TRACK crop center jumps (including speaker switches). `0` disables panning |
+| `--zoom-duration` | = `--pan-duration` | Seconds used for an eased zoom when the layout switches between the full letterboxed frame and a tracked crop (LETTERBOX↔TRACK). `0` restores instant layout switches |
 
 **Other:**
 
@@ -145,7 +168,8 @@ python3 main.py -i video.mp4 -o vertical.mp4 --frame-skip 0
 *   **Content-Aware Cropping:** YOLOv8 detects people and centers the vertical frame on them.
 *   **Automatic Letterboxing:** When people are too spread out for a vertical crop, black bars are added to preserve the full shot.
 *   **Scene-by-Scene Processing:** Decisions are made per scene for consistent, logical edits.
-*   **Smooth Subject Pans:** TRACK-to-TRACK crop-center jumps (including speaker switches) ease over `--pan-duration`. LETTERBOX layout switches stay instant.
+*   **Smooth Subject Pans:** TRACK-to-TRACK crop-center jumps (including speaker switches) ease over `--pan-duration`.
+*   **Smooth Zooms:** switching between the full letterboxed frame and a tracked crop eases over `--zoom-duration` — the region tightens onto the subject (or widens back out) while the letterbox bars shrink (or grow), instead of swapping layouts in one frame.
 *   **Native Resolution:** Output height matches the source to prevent quality loss from upscaling.
 *   **Frame-Accurate Processing:** Every frame is processed individually with the correct per-scene strategy — no timestamp rounding or scene boundary drift.
 *   **Hardware Encoder Support:** Optional `--encoder hw` auto-detects VideoToolbox (macOS) or NVENC (NVIDIA) with automatic fallback to libx264.
@@ -231,6 +255,14 @@ This script is built on a pipeline that uses specialized libraries for each step
 ---
 
 ### Changelog
+
+#### v1.6.0 — Smooth zooms between letterbox and tracked crops
+
+*   **LETTERBOX↔TRACK layout switches now ease** over `--zoom-duration` (default: same as `--pan-duration`). Going from the whole stream to a subject is a zoom-in whose source region shrinks from the full frame to the crop while its centre converges on the subject; going back is the reverse. Previously these boundaries swapped layouts in a single frame, which read as a jump cut even when pans were smooth.
+*   **One framing model.** Every output frame is now a full-height source region `(x, w)` scaled to the output width and letterboxed if wider than the output aspect. TRACK, LETTERBOX, pans and zooms are all the same `render_region` call, so nothing can drift between them.
+*   **Plan metadata:** scenes carry `transition = {kind, from_x, from_w, to_x, to_w, duration_frames}` (replaces `pan`), `boundary_kind` gains `zoom-in` / `zoom-out`, and the plan summary prints `N pan / N zoom / N hold / N layout-switch` with a warning when layout boundaries exist but no zoom was planned. `--plan-json` exports include `transition`.
+*   **Pan lab:** `--transition {pan,zoom-in,zoom-out}` for the synthetic fixture; `report.json` records `regionByFrame`.
+*   **Render E2E in CI:** `scripts/e2e_render.py` runs the real CLI on a fixture covering zoom-in, pan and zoom-out, asserts gradual motion in the encoded output, and uploads before/after videos plus a contact sheet as a workflow artifact.
 
 #### v1.5.1 — TRACK-to-TRACK pans on production H.264
 

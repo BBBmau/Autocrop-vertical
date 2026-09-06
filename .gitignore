@@ -13,6 +13,7 @@ __pycache__/
 # Temporary files
 temp_*.mp4
 pan-lab-output*/
+autocrop-e2e*/
 
 # Build artifacts
 build/

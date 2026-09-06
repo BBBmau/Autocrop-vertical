@@ -336,73 +336,133 @@ def frame_difference_score(frame_before, frame_after):
     return float(cv2.absdiff(before, after).mean() / 255.0)
 
 
+def scene_steady_region(scene_data, frame_width, frame_height):
+    """Source region (x, w) a scene settles on once its transition is over.
+
+    Every output frame is a full-height source region scaled to the output
+    width. TRACK scenes settle on a crop with the output aspect ratio around
+    the subject; LETTERBOX scenes settle on the whole frame, which the
+    renderer letterboxes. Expressing both as regions is what lets a zoom
+    between them be a continuous interpolation instead of a layout swap.
+    """
+    if scene_data.get('strategy') == 'TRACK' and \
+            scene_data.get('target_box') is not None:
+        box = calculate_crop_box(
+            scene_data['target_box'], frame_width, frame_height)
+        return box[0], box[2] - box[0]
+    return 0, frame_width
+
+
+def interpolate_region(start, end, frame_offset, duration_frames, frame_width):
+    """Ease (x, w) from start to end, keeping the region inside the source.
+
+    Width and centre are eased together with smoothstep, so a zoom converges
+    on the subject while it tightens and a pan (equal widths) reduces to the
+    lateral interpolation used since v1.5.
+    """
+    if duration_frames <= 1:
+        eased = 1.0
+    else:
+        eased = smoothstep(frame_offset / (duration_frames - 1))
+    width = int(round(start[1] + (end[1] - start[1]) * eased))
+    width = max(2, min(frame_width, width))
+    start_center = start[0] + start[1] / 2.0
+    end_center = end[0] + end[1] / 2.0
+    center = start_center + (end_center - start_center) * eased
+    x = int(round(center - width / 2.0))
+    x = max(0, min(frame_width - width, x))
+    return x, width
+
+
+def _transition_frames(duration, fps):
+    if duration is None or duration <= 0 or fps <= 0:
+        return 0
+    return max(2, int(round(duration * fps)))
+
+
 def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
                          fps, pan_duration=0.4, hard_cut_threshold=0.18,
-                         jitter_ratio=0.08):
-    """Annotate scenes with eased pan metadata.
+                         jitter_ratio=0.08, zoom_duration=None):
+    """Annotate scenes with eased transition metadata.
 
-    TRACK-to-TRACK crop jumps larger than jitter_ratio are eased over
-    pan_duration seconds. That includes speaker switches and over-segmented
-    shots — the cases that look choppy if the crop snaps in one frame.
-    LETTERBOX layout switches stay instant.
+    Each scene after the first gets `boundary_kind` and, when eased, a
+    `transition` dict {kind, from_x, from_w, to_x, to_w, duration_frames}
+    describing how the source region moves from the previous scene's steady
+    region to this scene's over the first frames of the scene:
 
-    video_path and hard_cut_threshold are accepted for call-site
-    compatibility but no longer gate pans. v1.5.0 compared decoded pixels
-    across each boundary via OpenCV random-access seeks; on production
-    H.264 those seeks are unreliable and nearly every boundary scored as a
-    hard cut, so no pan was ever applied.
+      pan        TRACK->TRACK crop jump larger than jitter_ratio, eased over
+                 pan_duration (speaker switches, over-segmented shots).
+      hold       TRACK->TRACK jump below jitter_ratio: no movement.
+      zoom-in    LETTERBOX->TRACK: the whole frame tightens onto the subject
+                 over zoom_duration.
+      zoom-out   TRACK->LETTERBOX: the crop widens back to the whole frame.
+      layout-switch  LETTERBOX<->TRACK with zoom_duration 0: instant swap.
+      cut        anything else (e.g. LETTERBOX->LETTERBOX).
+
+    zoom_duration defaults to pan_duration. video_path and hard_cut_threshold
+    are accepted for call-site compatibility but no longer gate anything;
+    v1.5.0's pixel-difference gate misfired on production H.264.
     """
+    if zoom_duration is None:
+        zoom_duration = pan_duration
     crop_width = min(frame_width, int(frame_height * ASPECT_RATIO))
-    if pan_duration <= 0 or fps <= 0:
-        pan_frames = 0
-    else:
-        pan_frames = max(2, int(round(pan_duration * fps)))
+    pan_frames = _transition_frames(pan_duration, fps)
+    zoom_frames = _transition_frames(zoom_duration, fps)
     min_pan_distance = crop_width * jitter_ratio
-    max_x = max(0, frame_width - crop_width)
 
     for i, scene in enumerate(scenes_analysis):
         scene['boundary_kind'] = 'start' if i == 0 else 'cut'
         scene['boundary_score'] = None
-        scene['pan'] = None
+        scene['transition'] = None
         if i == 0:
             continue
 
         previous = scenes_analysis[i - 1]
-        if pan_frames <= 0 or previous.get('strategy') != 'TRACK' or \
-           scene.get('strategy') != 'TRACK':
-            if previous.get('strategy') != scene.get('strategy'):
-                scene['boundary_kind'] = 'layout-switch'
-            continue
-        if previous.get('target_box') is None or scene.get('target_box') is None:
-            continue
-
-        previous_x = calculate_crop_box(
-            previous['target_box'], frame_width, frame_height)[0]
-        target_x = calculate_crop_box(
-            scene['target_box'], frame_width, frame_height)[0]
-        previous_x = min(max(0, previous_x), max_x)
-        target_x = min(max(0, target_x), max_x)
-        if abs(target_x - previous_x) < min_pan_distance:
-            scene['boundary_kind'] = 'hold'
-            continue
-
+        prev_strategy = previous.get('strategy')
+        cur_strategy = scene.get('strategy')
+        from_region = scene_steady_region(previous, frame_width, frame_height)
+        to_region = scene_steady_region(scene, frame_width, frame_height)
         available_frames = max(1, scene['end_frame'] - scene['start_frame'])
-        scene['boundary_kind'] = 'pan'
-        scene['pan'] = {
-            'from_x': previous_x,
-            'to_x': target_x,
-            'duration_frames': min(pan_frames, available_frames),
+
+        if prev_strategy != cur_strategy:
+            kind = 'zoom-in' if cur_strategy == 'TRACK' else 'zoom-out'
+            if zoom_frames <= 0:
+                scene['boundary_kind'] = 'layout-switch'
+                continue
+            duration = min(zoom_frames, available_frames)
+        else:
+            if cur_strategy != 'TRACK' or pan_frames <= 0:
+                continue
+            if previous.get('target_box') is None or \
+                    scene.get('target_box') is None:
+                continue
+            if abs(to_region[0] - from_region[0]) < min_pan_distance:
+                scene['boundary_kind'] = 'hold'
+                continue
+            kind = 'pan'
+            duration = min(pan_frames, available_frames)
+
+        scene['boundary_kind'] = kind
+        scene['transition'] = {
+            'kind': kind,
+            'from_x': from_region[0],
+            'from_w': from_region[1],
+            'to_x': to_region[0],
+            'to_w': to_region[1],
+            'duration_frames': duration,
         }
 
     return scenes_analysis
 
 
 def summarize_pan_plan(scenes_analysis):
-    """Count boundary kinds so a render can prove pans were actually planned."""
+    """Count boundary kinds so a render can prove transitions were planned."""
     summary = {
         'scenes': len(scenes_analysis),
         'track_to_track': 0,
+        'layout_boundaries': 0,
         'pan': 0,
+        'zoom': 0,
         'hold': 0,
         'layout_switch': 0,
     }
@@ -410,9 +470,13 @@ def summarize_pan_plan(scenes_analysis):
         previous, current = scenes_analysis[i - 1], scenes_analysis[i]
         if previous.get('strategy') == 'TRACK' and current.get('strategy') == 'TRACK':
             summary['track_to_track'] += 1
+        elif previous.get('strategy') != current.get('strategy'):
+            summary['layout_boundaries'] += 1
         kind = current.get('boundary_kind')
         if kind == 'pan':
             summary['pan'] += 1
+        elif kind in ('zoom-in', 'zoom-out'):
+            summary['zoom'] += 1
         elif kind == 'hold':
             summary['hold'] += 1
         elif kind == 'layout-switch':
@@ -436,65 +500,91 @@ def scene_index_for_frame(scenes_analysis, frame_number, current_index=0):
     return current_index
 
 
-def resolve_frame_crop(scene_data, frame_number, frame_width, frame_height):
-    """Return (strategy, crop_box) for one source frame.
+def resolve_frame_region(scene_data, frame_number, frame_width, frame_height):
+    """Return the source region (x, w) to show for one frame.
 
-    Single source of truth for per-frame crop placement. The production
-    encode loop, the unit tests, and scripts/pan_lab.py all call this so a
-    pan that works in the lab is the same pan that ships.
+    Single source of truth for per-frame framing. The production encode
+    loop, the unit tests, and scripts/pan_lab.py all call this so a
+    transition that works in the lab is the transition that ships.
     """
-    strategy = scene_data['strategy']
-    if strategy != 'TRACK':
-        return strategy, None
-    crop_box = calculate_crop_box(
-        scene_data['target_box'], frame_width, frame_height)
-    pan = scene_data.get('pan')
-    if pan:
-        scene_frame = frame_number - scene_data['start_frame']
-        if 0 <= scene_frame < pan['duration_frames']:
-            crop_width = crop_box[2] - crop_box[0]
-            x1 = interpolate_pan_x(
-                pan['from_x'],
-                pan['to_x'],
-                scene_frame,
-                pan['duration_frames'],
-                min_x=0,
-                max_x=max(0, frame_width - crop_width),
+    region = scene_steady_region(scene_data, frame_width, frame_height)
+    transition = scene_data.get('transition')
+    if transition:
+        offset = frame_number - scene_data['start_frame']
+        if 0 <= offset < transition['duration_frames']:
+            region = interpolate_region(
+                (transition['from_x'], transition['from_w']),
+                (transition['to_x'], transition['to_w']),
+                offset,
+                transition['duration_frames'],
+                frame_width,
             )
-            crop_box = (x1, 0, x1 + crop_width, frame_height)
-    return strategy, crop_box
+    return region
 
 
-def render_output_frame(frame, scene_data, frame_number, frame_width,
-                        frame_height, output_width, output_height):
-    """Crop/letterbox one source frame according to the scene plan."""
+def resolve_frame_crop(scene_data, frame_number, frame_width, frame_height):
+    """Compatibility view of resolve_frame_region as (label, crop_box).
+
+    label is 'LETTERBOX' with crop_box None when the region is the whole
+    frame, otherwise 'TRACK' with a full-height crop box. Mid-zoom frames
+    report 'TRACK' with a box wider than the output aspect ratio.
+    """
+    x, width = resolve_frame_region(
+        scene_data, frame_number, frame_width, frame_height)
+    if width >= frame_width:
+        return 'LETTERBOX', None
+    return 'TRACK', (x, 0, x + width, frame_height)
+
+
+def render_region(frame, x, width, frame_width, frame_height,
+                  output_width, output_height):
+    """Scale a full-height source region to the output, letterboxing if needed.
+
+    A region with the output aspect ratio fills the frame (TRACK). A wider
+    region is scaled to the output width and centred between black bars
+    (LETTERBOX, and every intermediate frame of a zoom).
+    """
     import cv2
     import numpy as np
-    strategy, crop_box = resolve_frame_crop(
-        scene_data, frame_number, frame_width, frame_height)
-    if strategy == 'TRACK':
-        processed = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
-        return cv2.resize(processed, (output_width, output_height))
-
-    scale_factor = output_width / frame_width
+    region = frame[:, x:x + width]
+    scale_factor = output_width / width
     scaled_height = int(frame_height * scale_factor)
-    scaled = cv2.resize(frame, (output_width, scaled_height))
+    if scaled_height >= output_height - 1:
+        return cv2.resize(region, (output_width, output_height))
+    scaled = cv2.resize(region, (output_width, scaled_height))
     output = np.zeros((output_height, output_width, 3), dtype=np.uint8)
     y_offset = (output_height - scaled_height) // 2
     output[y_offset:y_offset + scaled_height, :] = scaled
     return output
 
 
-def plan_frame_crops(scenes_analysis, total_frames, frame_width, frame_height):
-    """Per-frame crop left edge for the whole plan (None for LETTERBOX)."""
-    positions = []
+def render_output_frame(frame, scene_data, frame_number, frame_width,
+                        frame_height, output_width, output_height):
+    """Render one source frame according to the scene plan."""
+    x, width = resolve_frame_region(
+        scene_data, frame_number, frame_width, frame_height)
+    return render_region(frame, x, width, frame_width, frame_height,
+                         output_width, output_height)
+
+
+def plan_frame_regions(scenes_analysis, total_frames, frame_width, frame_height):
+    """Per-frame (x, w) source region for the whole plan."""
+    regions = []
     index = 0
     for frame_number in range(total_frames):
         index = scene_index_for_frame(scenes_analysis, frame_number, index)
-        _, crop_box = resolve_frame_crop(
-            scenes_analysis[index], frame_number, frame_width, frame_height)
-        positions.append(crop_box[0] if crop_box else None)
-    return positions
+        regions.append(resolve_frame_region(
+            scenes_analysis[index], frame_number, frame_width, frame_height))
+    return regions
+
+
+def plan_frame_crops(scenes_analysis, total_frames, frame_width, frame_height):
+    """Per-frame crop left edge for the whole plan (None for full-frame)."""
+    return [
+        None if width >= frame_width else x
+        for x, width in plan_frame_regions(
+            scenes_analysis, total_frames, frame_width, frame_height)
+    ]
 
 
 def serialize_plan(scenes_analysis, frame_width, frame_height, fps, ratio):
@@ -521,7 +611,7 @@ def serialize_plan(scenes_analysis, frame_width, frame_height, fps, ratio):
                 'strategy': s['strategy'],
                 'target_box': plain(s.get('target_box')),
                 'boundary_kind': s.get('boundary_kind'),
-                'pan': plain(s.get('pan')),
+                'transition': plain(s.get('transition')),
                 'people': len(s.get('analysis', [])),
             }
             for s in scenes_analysis
@@ -831,8 +921,12 @@ def cli():
                         help="Seconds used to smoothly pan the crop between tracked "
                              "subjects when the crop center jumps (default 0.4). "
                              "Applies to TRACK-to-TRACK reframes, including speaker "
-                             "switches. TRACK/LETTERBOX layout switches stay instant. "
-                             "Set to 0 to disable.")
+                             "switches. Set to 0 to disable.")
+    parser.add_argument('--zoom-duration', type=float, default=None,
+                        help="Seconds used to smoothly zoom between the full "
+                             "letterboxed frame and a tracked crop when the layout "
+                             "switches (LETTERBOX<->TRACK). Defaults to "
+                             "--pan-duration. Set to 0 for instant layout switches.")
     parser.add_argument('--encoder', type=str, default='auto',
                         help="Video encoder: 'auto' (libx264, default), 'hw' (auto-detect hardware encoder), "
                              "or a specific encoder name like 'h264_videotoolbox' or 'h264_nvenc'.")
@@ -987,7 +1081,9 @@ def cli():
         original_height,
         fps,
         pan_duration=args.pan_duration,
+        zoom_duration=args.zoom_duration,
     )
+    zoom_duration = args.zoom_duration if args.zoom_duration is not None else args.pan_duration
     step_end_time = time.time()
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.")
 
@@ -1008,23 +1104,31 @@ def cli():
         if i > 0:
             boundary = scene_data.get('boundary_kind', 'cut')
             transition_str = f", boundary: {boundary}"
-            if scene_data.get('pan'):
+            transition = scene_data.get('transition')
+            if transition:
+                seconds = transition['duration_frames'] / fps if fps else 0.0
                 transition_str += (
-                    f", pan: {args.pan_duration:.2f}s "
-                    f"({scene_data['pan']['duration_frames']}f)"
+                    f", {transition['kind']}: {seconds:.2f}s "
+                    f"({transition['duration_frames']}f, "
+                    f"w {transition['from_w']}->{transition['to_w']}, "
+                    f"x {transition['from_x']}->{transition['to_x']})"
                 )
         print(f"  - Scene {i+1} ({start_time} -> {end_time}): "
               f"Found {num_people} person(s){motion_str}. Strategy: {strategy}"
               f"{transition_str}")
 
     pan_summary = summarize_pan_plan(scenes_analysis)
-    print(f"   Transitions: {pan_summary['pan']} pan / {pan_summary['hold']} hold / "
-          f"{pan_summary['layout_switch']} layout-switch "
+    print(f"   Transitions: {pan_summary['pan']} pan / {pan_summary['zoom']} zoom / "
+          f"{pan_summary['hold']} hold / {pan_summary['layout_switch']} layout-switch "
           f"({pan_summary['track_to_track']} TRACK->TRACK boundaries, "
-          f"pan-duration {args.pan_duration:.2f}s)")
+          f"{pan_summary['layout_boundaries']} layout boundaries, "
+          f"pan-duration {args.pan_duration:.2f}s, zoom-duration {zoom_duration:.2f}s)")
     if pan_summary['track_to_track'] and not pan_summary['pan'] and args.pan_duration > 0:
         print("   ⚠️  No pans planned despite TRACK->TRACK boundaries. Every crop "
               "change will snap; inspect target boxes with --plan-json.")
+    if pan_summary['layout_boundaries'] and not pan_summary['zoom'] and zoom_duration > 0:
+        print("   ⚠️  No zooms planned despite LETTERBOX<->TRACK boundaries. Every "
+              "layout change will snap; inspect the plan with --plan-json.")
 
     if args.plan_json:
         import json
