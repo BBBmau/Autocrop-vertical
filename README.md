@@ -26,12 +26,28 @@ The `yolov8n.pt` model weights are downloaded automatically on first run.
 
 ---
 
+### Speaker Focus
+
+```bash
+autocrop -i in.mp4 -o out.mp4 --speaker-focus auto --speaker-min-dwell 1.2 \
+  --debug-overlay overlay.mp4 --plan-json plan.json
+```
+
+`speaker.py` tracks faces per frame in multi-person scenes, turns per-track
+speaking scores into speaker turns (with dwell/hysteresis) and splits the
+scene into sub-scenes the pan/zoom planner eases between. The scorer is the
+`speaker.score_speaking(video_path, scene, tracks, fps)` hook: return
+`{track_id: per-frame scores in [0, 1]}` or `None`. Face weights are fetched
+once to `~/.cache/autocrop/` (override with `AUTOCROP_FACE_MODEL=/path.onnx`).
+
 ### Render E2E (CI)
 
-`scripts/e2e_render.py` is the release gate. It builds a synthetic H.264
-fixture (wide shot → speaker left → speaker right → wide shot), runs the real
-`autocrop` CLI on it with only YOLO detection stubbed, and asserts that the
-rendered output zooms in, pans, and zooms out gradually instead of snapping.
+`scripts/e2e_render.py` is the release gate. It builds synthetic H.264
+fixtures — `transitions/` (wide shot → speaker left → speaker right → wide
+shot) and `speaker/` (two people, scripted speaker turns) — runs the real
+`autocrop` CLI on them with only the ML detectors stubbed, and asserts that
+the rendered output zooms, pans and follows speaker turns gradually instead
+of snapping.
 It writes `fixture.mp4` (before), `rendered.mp4` (after), a `contact-sheet.jpg`
 of source-vs-output frames around each boundary, `plan.json`, `report.json`
 and `summary.md`. The `CI` workflow runs it on every PR and uploads those
@@ -256,7 +272,15 @@ This script is built on a pipeline that uses specialized libraries for each step
 
 ### Changelog
 
-#### v1.6.1 — Render E2E hardening
+#### v1.7.0 — Speaker focus foundation (phase 1)
+
+*   **`--speaker-focus auto`** (default `off`): in scenes with 2+ people, faces are tracked per frame (OpenCV YuNet, CPU, ~7ms/frame at 640px) and the scene is split at speaker turns so the crop pans to whoever is talking, widens to the group during crosstalk, and holds through silence. Turns need `--speaker-min-dwell` seconds (default 1.2) before the frame follows, so interjections don't move it. This release ships the plumbing only: `speaker.score_speaking` is a hook that returns `None` until the audio-visual scorer lands (phase 2), so production framing is unchanged with the flag on or off.
+*   **`--debug-overlay PATH`**: writes the source video with face tracks, speaker scores, the active crop region and scene/boundary labels drawn on.
+*   **Fix: cut-free clips are now cropped.** PySceneDetect returned no scenes for a clip without cuts and the CLI copied the input through unchanged, leaving steady single-shot clips horizontal. `detect_scenes` now returns one whole-video scene.
+*   Plan JSON: scenes gain `boundary_source` (`speaker-turn`) and `speaker`; summary gains `speaker_turns`; the `Transitions:` line reports `N speaker-turns`.
+*   Render E2E gains a `speaker/` case (two people, scripted turns incl. an ignored interjection and crosstalk) that checks segmentation, transition kinds and timing, uploads `overlay.mp4`, and smoke-loads the real face detector.
+
+### v1.6.1 — Render E2E hardening
 
 *   **CI-only change.** `scripts/e2e_render.py` judges pans/zooms by the largest per-frame step relative to total travel (a snap is 1.0, an eased transition ≈0.15) and reads crop position from a median patch, so decoded 4:2:0 chroma noise on Linux ffmpeg builds no longer produces false failures. Artifact names are safe for PR runs.
 

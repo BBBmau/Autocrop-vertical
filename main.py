@@ -214,7 +214,10 @@ def detect_scenes(video_path, downscale=0, frame_skip=0,
     video_manager.start()
     scene_manager.detect_scenes(frame_source=video_manager, show_progress=True,
                                 frame_skip=frame_skip)
-    scene_list = scene_manager.get_scene_list()
+    # start_in_scene=True: a clip with no cuts is one scene spanning the whole
+    # video. Without it PySceneDetect returns [] and the CLI used to copy the
+    # input through un-cropped, so steady single-shot clips stayed horizontal.
+    scene_list = scene_manager.get_scene_list(start_in_scene=True)
     fps = video_manager.get_framerate()
     video_manager.release()
     return scene_list, fps
@@ -465,6 +468,7 @@ def summarize_pan_plan(scenes_analysis):
         'zoom': 0,
         'hold': 0,
         'layout_switch': 0,
+        'speaker_turns': 0,
     }
     for i in range(1, len(scenes_analysis)):
         previous, current = scenes_analysis[i - 1], scenes_analysis[i]
@@ -472,6 +476,8 @@ def summarize_pan_plan(scenes_analysis):
             summary['track_to_track'] += 1
         elif previous.get('strategy') != current.get('strategy'):
             summary['layout_boundaries'] += 1
+        if current.get('boundary_source') == 'speaker-turn':
+            summary['speaker_turns'] += 1
         kind = current.get('boundary_kind')
         if kind == 'pan':
             summary['pan'] += 1
@@ -611,8 +617,10 @@ def serialize_plan(scenes_analysis, frame_width, frame_height, fps, ratio):
                 'strategy': s['strategy'],
                 'target_box': plain(s.get('target_box')),
                 'boundary_kind': s.get('boundary_kind'),
+                'boundary_source': s.get('boundary_source'),
                 'transition': plain(s.get('transition')),
                 'people': len(s.get('analysis', [])),
+                'speaker': plain(s.get('speaker')),
             }
             for s in scenes_analysis
         ],
@@ -663,6 +671,15 @@ def get_media_info(video_path):
     except (FileNotFoundError, ValueError, KeyError):
         pass
     return info
+
+def format_timecode(seconds):
+    """HH:MM:SS.mmm like PySceneDetect's FrameTimecode.get_timecode()."""
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
 
 def format_duration(seconds):
     """Formats seconds into a human-readable string like '1h 32m 15s'."""
@@ -927,6 +944,21 @@ def cli():
                              "letterboxed frame and a tracked crop when the layout "
                              "switches (LETTERBOX<->TRACK). Defaults to "
                              "--pan-duration. Set to 0 for instant layout switches.")
+    parser.add_argument('--speaker-focus', type=str, default='off', choices=['off', 'auto'],
+                        help="In scenes with 2+ people, track faces per frame and split the "
+                             "scene at speaker turns so the crop pans to whoever is talking "
+                             "(default off). 'auto' needs a speaker scorer; until one is "
+                             "installed multi-person scenes keep their scene-level framing.")
+    parser.add_argument('--speaker-min-dwell', type=float, default=1.2,
+                        help="Seconds a new speaker must hold the floor before the frame "
+                             "follows them, and the minimum time spent on a speaker "
+                             "(default 1.2). Higher = calmer framing, slower to follow.")
+    parser.add_argument('--speaker-face-stride', type=int, default=2,
+                        help="Run face detection every N frames when tracking speakers "
+                             "(default 2). Higher = cheaper, coarser tracks.")
+    parser.add_argument('--debug-overlay', type=str, default=None,
+                        help="Also write the source video with face tracks, speaker scores "
+                             "and the active crop region drawn on, to this path.")
     parser.add_argument('--encoder', type=str, default='auto',
                         help="Video encoder: 'auto' (libx264, default), 'hw' (auto-detect hardware encoder), "
                              "or a specific encoder name like 'h264_videotoolbox' or 'h264_nvenc'.")
@@ -1035,12 +1067,11 @@ def cli():
     step_end_time = time.time()
     
     if not scenes:
-        # No scene cuts detected — usually a single continuous shot. Rather
-        # than aborting (which breaks pipelines that just need *some* output
-        # for every input), copy the source video through to the output path
-        # unchanged. The caller still gets a usable file; downstream consumers
-        # can decide whether to re-encode it themselves.
-        print("⚠️  No scenes were detected. Copying input to output unchanged.")
+        # Only reachable for an unreadable/empty video now that detect_scenes
+        # returns one whole-video scene for cut-free clips. Rather than
+        # aborting (which breaks pipelines that just need *some* output for
+        # every input), copy the source through unchanged.
+        print("⚠️  No frames could be analyzed. Copying input to output unchanged.")
         import shutil
         shutil.copyfile(input_video, final_output_video)
         print(f"✅ Wrote {final_output_video} (passthrough, no autocrop applied).")
@@ -1074,6 +1105,16 @@ def cli():
             'strategy': strategy,
             'target_box': target_box
         })
+    speaker_debug = {}
+    if args.speaker_focus == 'auto':
+        import speaker
+        def decide(analysis, height):
+            return decide_cropping_strategy(
+                analysis, height, motion_threshold=args.motion_threshold)
+        scenes_analysis, speaker_debug = speaker.apply_speaker_focus(
+            input_video, scenes_analysis, fps, original_height, decide,
+            min_dwell_sec=args.speaker_min_dwell,
+            face_stride=args.speaker_face_stride)
     plan_pan_transitions(
         input_video,
         scenes_analysis,
@@ -1091,8 +1132,8 @@ def cli():
     for i, scene_data in enumerate(scenes_analysis):
         num_people = len(scene_data['analysis'])
         strategy = scene_data['strategy']
-        start_time = scenes[i][0].get_timecode()
-        end_time = scenes[i][1].get_timecode()
+        start_time = format_timecode(scene_data['start_seconds'])
+        end_time = format_timecode(scene_data['end_seconds'])
         motions = [obj.get('motion', 0.0) for obj in scene_data['analysis']]
         motion_str = ""
         if motions:
@@ -1100,6 +1141,15 @@ def cli():
             motion_str = f", max motion: {top:.2f}"
             if num_people > 1 and top >= args.motion_threshold:
                 motion_str += " ⚡ (focused on most active)"
+        speaker_info = scene_data.get('speaker')
+        if speaker_info:
+            if speaker_info.get('kind') == 'track':
+                motion_str += (f", speaker: face t{speaker_info['track_id']} "
+                               f"({speaker_info.get('confidence', 0):.2f})")
+            elif speaker_info.get('kind') == 'group':
+                motion_str += ", speaker: crosstalk/group"
+            elif speaker_info.get('kind') == 'unsplit':
+                motion_str += f", speaker-focus skipped ({speaker_info.get('reason')})"
         transition_str = ""
         if i > 0:
             boundary = scene_data.get('boundary_kind', 'cut')
@@ -1122,6 +1172,7 @@ def cli():
           f"{pan_summary['hold']} hold / {pan_summary['layout_switch']} layout-switch "
           f"({pan_summary['track_to_track']} TRACK->TRACK boundaries, "
           f"{pan_summary['layout_boundaries']} layout boundaries, "
+          f"{pan_summary['speaker_turns']} speaker-turns, "
           f"pan-duration {args.pan_duration:.2f}s, zoom-duration {zoom_duration:.2f}s)")
     if pan_summary['track_to_track'] and not pan_summary['pan'] and args.pan_duration > 0:
         print("   ⚠️  No pans planned despite TRACK->TRACK boundaries. Every crop "
@@ -1137,6 +1188,13 @@ def cli():
                                      original_height, fps, args.ratio),
                       fh, indent=2)
         print(f"   Plan written to {args.plan_json}")
+
+    if args.debug_overlay:
+        import speaker
+        frames_written = speaker.render_debug_overlay(
+            input_video, args.debug_overlay, scenes_analysis, speaker_debug,
+            original_width, original_height, fps, resolve_frame_region)
+        print(f"   Debug overlay written to {args.debug_overlay} ({frames_written} frames)")
 
     if args.plan_only:
         track_count = sum(1 for s in scenes_analysis if s['strategy'] == 'TRACK')
