@@ -26,6 +26,23 @@ The `yolov8n.pt` model weights are downloaded automatically on first run.
 
 ---
 
+### Render E2E (CI)
+
+`scripts/e2e_render.py` is the release gate. It builds a synthetic H.264
+fixture (wide shot → speaker left → speaker right → wide shot), runs the real
+`autocrop` CLI on it with only YOLO detection stubbed, and asserts that the
+rendered output zooms in, pans, and zooms out gradually instead of snapping.
+It writes `fixture.mp4` (before), `rendered.mp4` (after), a `contact-sheet.jpg`
+of source-vs-output frames around each boundary, `plan.json`, `report.json`
+and `summary.md`. The `CI` workflow runs it on every PR and uploads those
+files as the `autocrop-e2e-<sha>` artifact; `viral-clip-extractor` runs the
+same script at its pinned ref before every deploy.
+
+```bash
+pip install opencv-python-headless "scenedetect[opencv]" numpy tqdm
+python3 scripts/e2e_render.py --output-dir autocrop-e2e
+```
+
 ### Local Pan Lab
 
 Use the lightweight pan lab when iterating on transition timing. It skips
@@ -245,6 +262,7 @@ This script is built on a pipeline that uses specialized libraries for each step
 *   **One framing model.** Every output frame is now a full-height source region `(x, w)` scaled to the output width and letterboxed if wider than the output aspect. TRACK, LETTERBOX, pans and zooms are all the same `render_region` call, so nothing can drift between them.
 *   **Plan metadata:** scenes carry `transition = {kind, from_x, from_w, to_x, to_w, duration_frames}` (replaces `pan`), `boundary_kind` gains `zoom-in` / `zoom-out`, and the plan summary prints `N pan / N zoom / N hold / N layout-switch` with a warning when layout boundaries exist but no zoom was planned. `--plan-json` exports include `transition`.
 *   **Pan lab:** `--transition {pan,zoom-in,zoom-out}` for the synthetic fixture; `report.json` records `regionByFrame`.
+*   **Render E2E in CI:** `scripts/e2e_render.py` runs the real CLI on a fixture covering zoom-in, pan and zoom-out, asserts gradual motion in the encoded output, and uploads before/after videos plus a contact sheet as a workflow artifact.
 
 #### v1.5.1 — TRACK-to-TRACK pans on production H.264
 
