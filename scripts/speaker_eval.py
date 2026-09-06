@@ -214,7 +214,7 @@ def cmd_evaluate(args):
 
 
 def cmd_evaluate_set(args):
-    clips = sorted(Path(args.dir).glob("*.mp4"))
+    clips = sorted(p for p in Path(args.dir).glob("*.mp4") if not p.name.startswith("."))
     reports, drafts = [], []
     for clip in clips:
         label_path = clip.with_suffix(".json")

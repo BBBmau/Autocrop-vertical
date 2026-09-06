@@ -53,7 +53,8 @@ jobs:
       # labels are verified the step fails below --min-accuracy.
       - name: Speaker focus accuracy on real footage
         run: |
-          curl -sSL -o eval-set.tar.gz \
+          set -o pipefail
+          curl -fsSL -o eval-set.tar.gz \
             "https://github.com/${{ github.repository }}/releases/download/eval-set-v1/speaker-eval-set-v1.tar.gz"
           mkdir -p eval-set && tar -xzf eval-set.tar.gz -C eval-set
           python scripts/speaker_eval.py evaluate-set eval-set \
