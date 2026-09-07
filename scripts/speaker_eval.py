@@ -79,6 +79,7 @@ def analyze_clip(clip, min_dwell=1.0, overlap="loudest", face_stride=2,
             min_dwell_sec=min_dwell, face_stride=face_stride, overlap=overlap, log=log)
     finally:
         speaker.track_faces = original_track_faces
+    autocrop.plan_face_zoom(split, width, height)
     autocrop.plan_pan_transitions(str(clip), split, width, height, fps)
     return {"width": width, "height": height, "fps": fps, "scenes": split,
             "debug": debug, "tracks_by_scene": tracks_by_scene}

@@ -44,6 +44,12 @@ several YOLO bodies (audience, bystanders) is tracked when it is the one
 talking instead of letterboxing everyone. Scenes keep their scene-level
 framing when there is no audio stream or the speaker extras are missing.
 
+When the chosen face is small (a wide shot), the crop tightens around it so
+the face is about `--face-zoom 0.18` of the output height, never upscaling
+the source more than `--face-zoom-max-upscale 2.0`; the face sits in the
+upper third of the frame. Zoomed and full-height crops ease into each other
+like any other pan/zoom. `--face-zoom 0` disables it.
+
 Requirements: `torch` (CPU is fine, ~1s per 6s of one face), `python_speech_features`,
 `scipy`, `ffmpeg`. Model weights (YuNet 0.2MB, Light-ASD 4MB) are fetched
 once to `~/.cache/autocrop/` and checksum-verified (override with
@@ -298,6 +304,13 @@ This script is built on a pipeline that uses specialized libraries for each step
 ---
 
 ### Changelog
+
+#### v1.9.0 — Face zoom: tighter crop for small faces
+
+*   **Face zoom.** TRACK scenes whose subject is a tracked face (speaker-focus turns, the lone-speaking-face rule, and now single-person scenes, whose lone face is tracked too) get a `zoom_region` sized so the face is `--face-zoom` (default 0.18) of the output height, capped at `--face-zoom-max-upscale` (default 2.0) and skipped when the gain would be under 10%. The face centre sits at 38% of the crop height. On the NASA briefing wide shot this turns a 30px face above audience backs into a readable 2x close-up of the moderator.
+*   **Regions are `(x, y, w, h)`.** `scene_steady_region`, `interpolate_region`, `resolve_frame_region`, `render_region` and `plan_frame_regions` carry a full rectangle; transitions store `from_y/from_h/to_y/to_h`, so zoomed and full-height crops ease into each other on all four axes. `interpolate_region` still accepts `(x, w)` pairs. Upscaled crops are resampled with bicubic filtering.
+*   **Plan output:** scenes print `face-zoom 2.00x (crop WxH at x,y)`, transitions print `h a->b` when height changes, the summary counts `N face-zoom scenes`, and `--plan-json` exports `focus_face` and `zoom_region`.
+*   **E2E:** new `facezoom` case (small heads, A-then-B script) asserts the plan, the face placement, the visible source height read back from the rendered frames (~360 of 720px), and an eased pan between the two zoomed crops.
 
 #### v1.8.0 — Speaker focus: audio-visual speaker scoring (phase 2)
 

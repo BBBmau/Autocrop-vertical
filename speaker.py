@@ -411,6 +411,7 @@ def split_scene_by_speaker(scene, segments, tracks, frame_height,
             sub["target_box"] = median_box(track, seg["start_frame"], seg["end_frame"])
             sub["speaker"] = {"kind": "track", "track_id": track["id"],
                               "confidence": seg["confidence"]}
+            sub["focus_face"] = sub["target_box"]
         sub["boundary_source"] = "speaker-turn" if k > 0 else scene.get("boundary_source")
         out.append(sub)
     return out
@@ -430,7 +431,7 @@ def _speaking_fraction(scores, track, start_frame, on_threshold=0.5):
 
 def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                         decide_strategy, min_dwell_sec=1.2, face_stride=2,
-                        overlap="loudest", log=print):
+                        overlap="loudest", zoom_faces=True, log=print):
     """Run tracking + scoring on multi-person scenes and split them by speaker.
 
     Returns (new_scenes_analysis, debug) where debug maps original scene
@@ -440,6 +441,14 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
     for idx, scene in enumerate(scenes_analysis):
         people = len(scene.get("analysis") or [])
         if people < 2:
+            if zoom_faces and people == 1 and scene.get("strategy") == "TRACK":
+                # One person: no speaker question, but a face box lets the
+                # planner tighten the crop when the face is small (face zoom).
+                tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
+                                     fps, face_stride=face_stride)
+                if len(tracks) == 1:
+                    scene["focus_face"] = median_box(tracks[0], scene["start_frame"],
+                                                     scene["end_frame"])
             out.append(scene)
             continue
         tracks = track_faces(video_path, scene["start_frame"], scene["end_frame"],
@@ -458,6 +467,7 @@ def apply_speaker_focus(video_path, scenes_analysis, fps, frame_height,
                 scene["speaker"] = {"kind": "track", "track_id": track["id"],
                                     "confidence": round(fraction, 3),
                                     "reason": "single-speaking-face"}
+                scene["focus_face"] = scene["target_box"]
                 log(f"   speaker-focus: scene {idx + 1} has {people} people, one face "
                     f"speaking {fraction:.0%} of the time -> TRACK that face")
             else:
@@ -546,8 +556,8 @@ def render_debug_overlay(video_path, out_path, scenes_analysis, debug,
             cv2.putText(frame, label, (box[0], max(14, box[1] - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         if scene:
-            x, w = resolve_region(scene, n, frame_width, frame_height)
-            cv2.rectangle(frame, (int(x), 0), (int(x + w) - 1, frame_height - 1),
+            x, y, w, h = resolve_region(scene, n, frame_width, frame_height)
+            cv2.rectangle(frame, (int(x), int(y)), (int(x + w) - 1, int(y + h) - 1),
                           (255, 0, 255), 2)
             kind = scene.get("boundary_kind", "")
             spk = scene.get("speaker") or {}

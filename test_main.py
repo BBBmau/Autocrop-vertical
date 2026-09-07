@@ -174,6 +174,107 @@ class PanMathTests(unittest.TestCase):
         self.assertEqual(summary["layout_switch"], 2)
 
 
+class FaceZoomTests(unittest.TestCase):
+    W, H = 1280, 720
+
+    def test_small_face_gets_a_tight_aspect_correct_region(self):
+        face = [240, 128, 272, 168]          # 40px tall face in 720p
+        region = main.face_zoom_region(face, self.W, self.H)
+        self.assertIsNotNone(region)
+        x, y, w, h = region
+        # 40 / 0.18 = 222 wanted, but max upscale 2.0 caps at 360.
+        self.assertEqual(h, 360)
+        self.assertAlmostEqual(w / h, 9 / 16, delta=0.01)
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + w, self.W)
+        self.assertLessEqual(y + h, self.H)
+        # Face centre sits in the upper third of the crop, horizontally centred.
+        cy = (face[1] + face[3]) / 2
+        self.assertAlmostEqual((cy - y) / h, 0.38, delta=0.03)
+        self.assertAlmostEqual(x + w / 2, (face[0] + face[2]) / 2, delta=1)
+
+    def test_large_face_keeps_full_height(self):
+        face = [500, 200, 700, 400]          # 200px face = 28% of height
+        self.assertIsNone(main.face_zoom_region(face, self.W, self.H))
+
+    def test_marginal_gain_is_skipped(self):
+        # 120px face -> 667px crop = 93% of height: not worth a zoom.
+        face = [500, 200, 620, 320]
+        self.assertIsNone(main.face_zoom_region(face, self.W, self.H))
+
+    def test_disabled_or_missing_face(self):
+        self.assertIsNone(main.face_zoom_region([0, 0, 30, 30], self.W, self.H, face_fraction=0))
+        self.assertIsNone(main.face_zoom_region(None, self.W, self.H))
+
+    def test_region_is_clamped_at_frame_edges(self):
+        x, y, w, h = main.face_zoom_region([0, 0, 30, 30], self.W, self.H)
+        self.assertEqual((x, y), (0, 0))
+        x, y, w, h = main.face_zoom_region([1250, 690, 1280, 720], self.W, self.H)
+        self.assertEqual((x + w, y + h), (self.W, self.H))
+
+    def test_plan_face_zoom_only_touches_track_scenes_with_a_face(self):
+        scenes = [
+            {"start_frame": 0, "end_frame": 10, "strategy": "TRACK",
+             "target_box": [240, 128, 272, 168], "focus_face": [240, 128, 272, 168]},
+            {"start_frame": 10, "end_frame": 20, "strategy": "TRACK",
+             "target_box": [600, 100, 800, 700]},                    # body box, no face
+            {"start_frame": 20, "end_frame": 30, "strategy": "LETTERBOX",
+             "target_box": None, "focus_face": [240, 128, 272, 168]},
+        ]
+        self.assertEqual(main.plan_face_zoom(scenes, self.W, self.H), 1)
+        self.assertIsNotNone(scenes[0]["zoom_region"])
+        self.assertIsNone(scenes[1]["zoom_region"])
+        self.assertIsNone(scenes[2]["zoom_region"])
+        self.assertEqual(main.summarize_pan_plan(scenes)["face_zoom"], 1)
+        self.assertEqual(main.scene_steady_region(scenes[0], self.W, self.H),
+                         tuple(scenes[0]["zoom_region"]))
+
+    def test_zoom_between_full_height_and_face_crop_eases_all_four_axes(self):
+        scenes = [
+            {"start_frame": 0, "end_frame": 10, "strategy": "TRACK",
+             "target_box": [600, 100, 800, 700]},
+            {"start_frame": 10, "end_frame": 30, "strategy": "TRACK",
+             "target_box": [240, 128, 272, 168], "focus_face": [240, 128, 272, 168]},
+        ]
+        main.plan_face_zoom(scenes, self.W, self.H)
+        main.plan_pan_transitions(None, scenes, self.W, self.H, 10, pan_duration=0.5)
+        self.assertEqual(scenes[1]["boundary_kind"], "pan")
+        t = scenes[1]["transition"]
+        self.assertEqual((t["from_h"], t["to_h"]), (720, 360))
+        regions = main.plan_frame_regions(scenes, 30, self.W, self.H)
+        self.assertEqual(regions[9], (498, 0, 405, 720))   # centred on the body box
+        self.assertEqual(regions[15], tuple(scenes[1]["zoom_region"]))
+        heights = [r[3] for r in regions[10:15]]
+        self.assertTrue(all(a >= b for a, b in zip(heights, heights[1:])))
+        self.assertGreaterEqual(len(set(heights)), 3)
+        for x, y, w, h in regions:
+            self.assertTrue(0 <= x and x + w <= self.W and 0 <= y and y + h <= self.H)
+
+    def test_two_zoomed_faces_of_equal_size_hold_or_pan_by_position(self):
+        a = {"start_frame": 0, "end_frame": 10, "strategy": "TRACK",
+             "target_box": [240, 128, 272, 168], "focus_face": [240, 128, 272, 168]}
+        b = {"start_frame": 10, "end_frame": 20, "strategy": "TRACK",
+             "target_box": [244, 130, 276, 170], "focus_face": [244, 130, 276, 170]}
+        c = {"start_frame": 20, "end_frame": 30, "strategy": "TRACK",
+             "target_box": [900, 128, 932, 168], "focus_face": [900, 128, 932, 168]}
+        scenes = [a, b, c]
+        main.plan_face_zoom(scenes, self.W, self.H)
+        main.plan_pan_transitions(None, scenes, self.W, self.H, 10, pan_duration=0.4)
+        self.assertEqual(scenes[1]["boundary_kind"], "hold")
+        self.assertEqual(scenes[2]["boundary_kind"], "pan")
+
+    def test_render_region_upscales_face_crop_to_output(self):
+        import numpy as np
+        frame = np.zeros((self.H, self.W, 3), np.uint8)
+        frame[128:168, 240:272] = 255
+        out = main.render_region(frame, 55, 202, self.W, self.H, 406, 720, y=11, height=360)
+        self.assertEqual(out.shape, (720, 406, 3))
+        # The 40px face is now ~80px tall in the output.
+        rows = np.where(out[:, :, 0].max(axis=1) > 128)[0]
+        self.assertGreater(rows[-1] - rows[0], 70)
+
+
 class ProductionRenderPathTests(unittest.TestCase):
     """Drive the exact per-frame functions the encode loop uses."""
 
@@ -214,20 +315,20 @@ class ProductionRenderPathTests(unittest.TestCase):
         scenes = self.zoom_plan()
         regions = main.plan_frame_regions(scenes, 50, self.WIDTH, self.HEIGHT)
 
-        self.assertEqual(set(regions[:10]), {(0, 160)})
+        self.assertEqual(set(regions[:10]), {(0, 0, 160, 90)})
         zoom_in = regions[10:16]
-        self.assertEqual(zoom_in[0], (0, 160))
-        self.assertEqual(zoom_in[-1], (110, 50))
-        widths = [w for _, w in zoom_in]
+        self.assertEqual(zoom_in[0], (0, 0, 160, 90))
+        self.assertEqual(zoom_in[-1], (110, 0, 50, 90))
+        widths = [r[2] for r in zoom_in]
         self.assertTrue(all(a > b for a, b in zip(widths, widths[1:])))
-        self.assertEqual(set(regions[16:30]), {(110, 50)})
+        self.assertEqual(set(regions[16:30]), {(110, 0, 50, 90)})
 
         zoom_out = regions[30:36]
-        self.assertEqual(zoom_out[0], (110, 50))
-        self.assertEqual(zoom_out[-1], (0, 160))
-        widths = [w for _, w in zoom_out]
+        self.assertEqual(zoom_out[0], (110, 0, 50, 90))
+        self.assertEqual(zoom_out[-1], (0, 0, 160, 90))
+        widths = [r[2] for r in zoom_out]
         self.assertTrue(all(a < b for a, b in zip(widths, widths[1:])))
-        self.assertEqual(set(regions[36:]), {(0, 160)})
+        self.assertEqual(set(regions[36:]), {(0, 0, 160, 90)})
 
     def test_zero_pan_duration_snaps_in_one_frame(self):
         scenes = self.two_scene_plan(pan_duration=0)
