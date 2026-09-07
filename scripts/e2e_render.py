@@ -70,6 +70,16 @@ SPEAKER_SCRIPT = [
     (6.8, 8.0, [0]),
 ]
 SPEAKER_DWELL_SEC = 1.0
+# Face-zoom case: same two people, but drawn with small heads (56px faces =
+# 8% of frame height, like a wide shot) and a simple A-then-B script.
+FACEZOOM_HEAD_R = 28
+FACEZOOM_SCENES = [
+    (0, 8, (90, 100, 120), [W // 4, W * 3 // 4]),
+]
+FACEZOOM_SCRIPT = [
+    (0.0, 4.0, [0]),
+    (4.0, 8.0, [1]),
+]
 
 
 def scene_at(scenes, sec):
@@ -79,15 +89,15 @@ def scene_at(scenes, sec):
     return scenes[-1]
 
 
-def person_box(center_x):
-    return [center_x - 105, HEAD_Y - HEAD_R, center_x + 105, H - 70]
+def person_box(center_x, head_r=HEAD_R):
+    return [center_x - int(1.4 * head_r), HEAD_Y - head_r, center_x + int(1.4 * head_r), H - 70]
 
 
-def face_box(center_x):
-    return [center_x - HEAD_R, HEAD_Y - HEAD_R, center_x + HEAD_R, HEAD_Y + HEAD_R]
+def face_box(center_x, head_r=HEAD_R):
+    return [center_x - head_r, HEAD_Y - head_r, center_x + head_r, HEAD_Y + head_r]
 
 
-def make_fixture(path, fps, scenes, label):
+def make_fixture(path, fps, scenes, label, head_r=HEAD_R, row_gradient=False):
     raw = path.with_name(path.stem + "_raw.mp4")
     writer = cv2.VideoWriter(str(raw), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
     total = int(scenes[-1][1] * fps)
@@ -98,12 +108,16 @@ def make_fixture(path, fps, scenes, label):
         # source columns are on screen. Other channels stay >= 40 so letterbox
         # bars (pure black) are distinguishable.
         frame[:, :, 0] = (np.arange(W) * 255 // (W - 1)).astype(np.uint8)[None, :]
+        if row_gradient:
+            # Red channel encodes the source row (40..255) so output pixels
+            # reveal how much source height is on screen (face zoom).
+            frame[:, :, 2] = (40 + np.arange(H) * 215 // (H - 1)).astype(np.uint8)[:, None]
         for x in range(0, W, 80):
             cv2.line(frame, (x, 0), (x, H), (80, 80, 80), 1)
         for cx in people:
-            box = person_box(cx)
-            cv2.circle(frame, (cx, HEAD_Y), HEAD_R, PERSON_COLOR, -1)
-            cv2.rectangle(frame, (box[0], box[1] + 2 * HEAD_R), (box[2], box[3]),
+            box = person_box(cx, head_r)
+            cv2.circle(frame, (cx, HEAD_Y), head_r, PERSON_COLOR, -1)
+            cv2.rectangle(frame, (box[0], box[1] + 2 * head_r), (box[2], box[3]),
                           PERSON_COLOR, -1)
         cv2.putText(frame, f"autocrop e2e {label}  t={n / fps:05.2f}s", (30, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (235, 235, 235), 2, cv2.LINE_AA)
@@ -124,35 +138,61 @@ def make_fixture(path, fps, scenes, label):
     return total
 
 
-def fake_analyze_for(scenes):
+def fake_analyze_for(scenes, head_r=HEAD_R):
     """Stand-in for YOLO: report the fixture's scripted people, if any."""
     def fake_analyze_scene_content(video_path, start, end, samples=1):
         _, _, _, people = scene_at(scenes, start.get_seconds() + 0.05)
-        return [{"person_box": person_box(cx), "face_box": None, "motion": 0.0}
+        return [{"person_box": person_box(cx, head_r), "face_box": None, "motion": 0.0}
                 for cx in people]
     return fake_analyze_scene_content
 
 
-def fake_track_faces_for(scenes):
+def fake_track_faces_for(scenes, head_r=HEAD_R):
     """Stand-in for YuNet tracking: one steady face track per drawn person."""
     def fake_track_faces(video_path, start_frame, end_frame, fps, **kwargs):
         _, _, _, people = scene_at(scenes, start_frame / fps + 0.05)
         return [{"id": i, "first": start_frame, "last": end_frame - 1,
-                 "boxes": {n: face_box(cx) for n in range(start_frame, end_frame)}}
+                 "boxes": {n: face_box(cx, head_r) for n in range(start_frame, end_frame)}}
                 for i, cx in enumerate(people)]
     return fake_track_faces
 
 
-def fake_score_speaking(video_path, scene, tracks, fps, log=None):
-    length = scene["end_frame"] - scene["start_frame"]
-    scores = {t["id"]: np.zeros(length) for t in tracks}
-    for start, end, ids in SPEAKER_SCRIPT:
-        a = int(round(start * fps)) - scene["start_frame"]
-        b = int(round(end * fps)) - scene["start_frame"]
-        for i in ids:
-            if i in scores:
-                scores[i][max(0, a):max(0, b)] = 0.9
-    return scores
+def fake_score_for(script):
+    def fake_score_speaking(video_path, scene, tracks, fps, log=None):
+        length = scene["end_frame"] - scene["start_frame"]
+        scores = {t["id"]: np.zeros(length) for t in tracks}
+        for start, end, ids in script:
+            a = int(round(start * fps)) - scene["start_frame"]
+            b = int(round(end * fps)) - scene["start_frame"]
+            for i in ids:
+                if i in scores:
+                    scores[i][max(0, a):max(0, b)] = 0.9
+        return scores
+    return fake_score_speaking
+
+
+fake_score_speaking = fake_score_for(SPEAKER_SCRIPT)
+
+
+def measure_visible_height(path):
+    """Per output frame: source rows visible (from the red row gradient)."""
+    cap = cv2.VideoCapture(str(path))
+    heights = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        h, w = frame.shape[:2]
+        # Sample a background band near the left edge (people are centred on
+        # W/4 and 3W/4, far from the crop's left edge), a few rows in from the
+        # top/bottom to dodge codec ringing. The median over a 40px-wide band
+        # ignores the fixture's 1px grid lines when a pan edge crosses one.
+        top = float(np.median(frame[4:10, 2:42, 2]))
+        bottom = float(np.median(frame[h - 10:h - 4, 2:42, 2]))
+        to_row = lambda code: (code - 40) * (H - 1) / 215  # noqa: E731
+        heights.append(int(round(to_row(bottom) - to_row(top))))
+    cap.release()
+    return heights
 
 
 def run_cli(fixture, rendered, plan_path, args, extra):
@@ -487,13 +527,113 @@ def run_speaker(out_dir, args):
     return ok, report, lines
 
 
+def run_facezoom(out_dir, args):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fixture, rendered, plan_path = (out_dir / "fixture.mp4", out_dir / "rendered.mp4",
+                                    out_dir / "plan.json")
+    overlay = out_dir / "overlay.mp4"
+    fps = args.fps
+    head_r = FACEZOOM_HEAD_R
+    total_frames = make_fixture(fixture, fps, FACEZOOM_SCENES, "facezoom",
+                                head_r=head_r, row_gradient=True)
+    autocrop.analyze_scene_content = fake_analyze_for(FACEZOOM_SCENES, head_r)
+    speaker.track_faces = fake_track_faces_for(FACEZOOM_SCENES, head_r)
+    speaker.score_speaking = fake_score_for(FACEZOOM_SCRIPT)
+    plan = run_cli(fixture, rendered, plan_path, args, [
+        "--speaker-focus", "auto",
+        "--speaker-min-dwell", str(SPEAKER_DWELL_SEC),
+        "--debug-overlay", str(overlay),
+    ])
+    summary = plan["summary"]
+    scenes = plan["scenes"]
+    _, lefts = measure_output(rendered)
+    heights = measure_visible_height(rendered)
+
+    checks = {}
+    checks["frameCount"] = {"expected": total_frames, "actual": len(heights),
+                            "ok": len(heights) == total_frames}
+    # 56px face / 0.18 = 311px wanted; max upscale 2.0 caps the crop at 360.
+    expected_h = H // 2
+    zooms = [s.get("zoom_region") for s in scenes]
+    checks["plan"] = {
+        "zoomRegions": zooms, "faceZoomScenes": summary.get("face_zoom"),
+        "ok": len(scenes) == 2 and summary.get("face_zoom") == 2
+        and all(z and z[3] == expected_h for z in zooms),
+    }
+    # Face centre sits in the upper third of every zoomed crop.
+    face_cy = HEAD_Y
+    placements = [round((face_cy - z[1]) / z[3], 2) for z in zooms if z]
+    checks["facePlacement"] = {"fractions": placements,
+                               "ok": all(abs(p - 0.38) < 0.05 for p in placements)}
+    turns = [s for s in scenes if s.get("boundary_source") == "speaker-turn"]
+    t = turns[0]["transition"] if turns and turns[0].get("transition") else None
+    checks["turn"] = {
+        "kind": turns[0]["boundary_kind"] if turns else None,
+        "heights": (t["from_h"], t["to_h"]) if t else None,
+        "ok": bool(t) and turns[0]["boundary_kind"] == "pan"
+        and t["from_h"] == t["to_h"] == expected_h,
+    }
+    start = turns[0]["start_frame"] if turns else None
+    pan_frames = max(2, int(round(args.pan_duration * fps)))
+    # Rendered frames show ~half the source height throughout (2x zoom).
+    # Pan frames are skipped: while the crop edge sweeps across person A the
+    # edge probe reads the drawn body, not the background gradient.
+    steady = [v for i, v in enumerate(heights[5:-5], start=5)
+              if start is None or not (start - 1 <= i <= start + pan_frames + 1)]
+    checks["visibleHeight"] = {
+        "min": min(steady) if steady else None, "max": max(steady) if steady else None,
+        "expected": expected_h, "framesChecked": len(steady),
+        "ok": bool(steady) and all(abs(v - expected_h) <= 12 for v in steady),
+    }
+    pan = window(lefts, start, pan_frames) if start is not None else []
+    checks["pan"] = dict(values=pan, **gradual(pan, True, 6, 0.4, noise=12)) if pan else \
+        {"ok": False, "distinct": 0, "maxStep": 0, "maxStepRatio": None}
+    checks["overlay"] = {"ok": overlay.exists() and overlay.stat().st_size > 0,
+                         "bytes": overlay.stat().st_size if overlay.exists() else 0}
+    ok = all(c["ok"] for c in checks.values())
+
+    if start is not None:
+        contact_sheet(fixture, rendered, [("A->B pan (zoomed)", start)],
+                      out_dir / "contact-sheet.jpg")
+    report = {"ok": ok, "checks": checks, "script": FACEZOOM_SCRIPT,
+              "visibleSourceHeightByFrame": heights, "leftSourceXByFrame": lefts}
+    (out_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    lines = [
+        f"### face zoom — {'PASS' if ok else 'FAIL'}",
+        "",
+        f"Two people with small ({2 * head_r}px, {100 * 2 * head_r // H}% of height) faces, "
+        f"A talks 0-4s then B 4-8s. The crop should tighten to {expected_h}px of source "
+        f"height (2x, capped by --face-zoom-max-upscale) around the talker's face and pan "
+        f"between the two zoomed crops. Plan: `{summary.get('face_zoom')} face-zoom scenes, "
+        f"{summary.get('speaker_turns')} speaker-turns`.",
+        "",
+        "| check | result | detail |",
+        "|---|---|---|",
+        f"| frame count | {mark(checks['frameCount']['ok'])} | "
+        f"{checks['frameCount']['actual']} / {checks['frameCount']['expected']} |",
+        f"| plan | {mark(checks['plan']['ok'])} | zoom regions {zooms} |",
+        f"| face placement | {mark(checks['facePlacement']['ok'])} | "
+        f"face centre at {placements} of crop height (want 0.38) |",
+        f"| A->B turn | {mark(checks['turn']['ok'])} | {checks['turn']['kind']}, "
+        f"h {checks['turn']['heights']} |",
+        f"| visible source height | {mark(checks['visibleHeight']['ok'])} | "
+        f"{checks['visibleHeight']['min']}-{checks['visibleHeight']['max']}px of {H} "
+        f"(want ~{expected_h}) |",
+        f"| A->B pan | {mark(checks['pan']['ok'])} | {describe(checks['pan'], pan) if pan else 'n/a'} |",
+        f"| debug overlay | {mark(checks['overlay']['ok'])} | {checks['overlay']['bytes']} bytes |",
+    ]
+    return ok, report, lines
+
+
 def run(args):
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     results = {}
     lines = []
     all_ok = True
-    for name, fn in (("transitions", run_transitions), ("speaker", run_speaker)):
+    for name, fn in (("transitions", run_transitions), ("speaker", run_speaker),
+                     ("facezoom", run_facezoom)):
         if args.case not in ("all", name):
             continue
         try:
@@ -510,7 +650,7 @@ def run(args):
         "",
         f"pan {args.pan_duration}s, zoom {args.zoom_duration}s, {args.fps}fps. "
         "Per case: `fixture.mp4` (before), `rendered.mp4` (after), `contact-sheet.jpg`, "
-        "`plan.json`, `report.json`; speaker case also `overlay.mp4`.",
+        "`plan.json`, `report.json`; speaker and facezoom cases also `overlay.mp4`.",
         "",
     ]
     summary_md = "\n".join(header + lines)
@@ -524,7 +664,7 @@ def run(args):
 def main_():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--output-dir", default="autocrop-e2e")
-    parser.add_argument("--case", default="all", choices=["all", "transitions", "speaker"])
+    parser.add_argument("--case", default="all", choices=["all", "transitions", "speaker", "facezoom"])
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--pan-duration", type=float, default=0.4)
     parser.add_argument("--zoom-duration", type=float, default=0.5)

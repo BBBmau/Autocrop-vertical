@@ -189,7 +189,7 @@ def render_variant(source_path, output_path, scenes, duration_sec,
             break
         index = autocrop.scene_index_for_frame(plan, frame_number, index)
         scene = plan[index]
-        x, region_width = autocrop.resolve_frame_region(
+        x, _region_y, region_width, _region_h = autocrop.resolve_frame_region(
             scene, frame_number, width, height)
         output = autocrop.render_output_frame(
             frame, scene, frame_number, width, height,

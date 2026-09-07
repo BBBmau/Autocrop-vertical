@@ -339,42 +339,121 @@ def frame_difference_score(frame_before, frame_after):
     return float(cv2.absdiff(before, after).mean() / 255.0)
 
 
-def scene_steady_region(scene_data, frame_width, frame_height):
-    """Source region (x, w) a scene settles on once its transition is over.
+def face_zoom_region(face_box, frame_width, frame_height, face_fraction=0.18,
+                     max_upscale=2.0, min_gain=0.9, face_y_fraction=0.38):
+    """Tighter (x, y, w, h) source region that makes a small face readable.
 
-    Every output frame is a full-height source region scaled to the output
-    width. TRACK scenes settle on a crop with the output aspect ratio around
-    the subject; LETTERBOX scenes settle on the whole frame, which the
-    renderer letterboxes. Expressing both as regions is what lets a zoom
-    between them be a continuous interpolation instead of a layout swap.
+    Sizes the crop so the face is `face_fraction` of the output height,
+    but never upscales the source by more than `max_upscale` (quality) and
+    never bothers when the crop would still be >= min_gain of the frame
+    height. The face centre sits at `face_y_fraction` of the crop (upper
+    third) so there is more room for shoulders than for ceiling. Returns
+    None when no zoom is warranted.
+    """
+    if face_box is None or face_fraction <= 0:
+        return None
+    face_h = face_box[3] - face_box[1]
+    if face_h <= 0:
+        return None
+    crop_h = face_h / face_fraction
+    crop_h = max(frame_height / max(1.0, max_upscale), crop_h)
+    crop_h = min(frame_height, crop_h)
+    if crop_h >= min_gain * frame_height:
+        return None
+    crop_w = crop_h * ASPECT_RATIO
+    if crop_w > frame_width:
+        crop_w = frame_width
+        crop_h = crop_w / ASPECT_RATIO
+    crop_h = int(round(crop_h))
+    crop_w = int(round(crop_w))
+    cx = (face_box[0] + face_box[2]) / 2.0
+    cy = (face_box[1] + face_box[3]) / 2.0
+    x = int(round(cx - crop_w / 2.0))
+    y = int(round(cy - face_y_fraction * crop_h))
+    x = max(0, min(frame_width - crop_w, x))
+    y = max(0, min(frame_height - crop_h, y))
+    return x, y, crop_w, crop_h
+
+
+def plan_face_zoom(scenes_analysis, frame_width, frame_height,
+                   face_fraction=0.18, max_upscale=2.0):
+    """Attach `zoom_region` to TRACK scenes whose `focus_face` is small.
+
+    `focus_face` is set by the speaker-focus pass (a tracked face box); scenes
+    framed from a YOLO body box have no face to size against and keep the
+    full-height crop. Returns the number of scenes that got a zoom.
+    """
+    count = 0
+    for scene in scenes_analysis:
+        scene['zoom_region'] = None
+        if scene.get('strategy') != 'TRACK' or scene.get('target_box') is None:
+            continue
+        region = face_zoom_region(scene.get('focus_face'), frame_width,
+                                  frame_height, face_fraction, max_upscale)
+        if region is not None:
+            scene['zoom_region'] = region
+            count += 1
+    return count
+
+
+def scene_steady_region(scene_data, frame_width, frame_height):
+    """Source region (x, y, w, h) a scene settles on once its transition is over.
+
+    Every output frame is a source region scaled to the output width and
+    letterboxed if it is wider than the output aspect. TRACK scenes settle
+    on a full-height crop with the output aspect ratio around the subject —
+    or on a tighter `zoom_region` when the subject's face is small (see
+    plan_face_zoom); LETTERBOX scenes settle on the whole frame. Expressing
+    all of them as regions is what lets a zoom between them be a continuous
+    interpolation instead of a layout swap.
     """
     if scene_data.get('strategy') == 'TRACK' and \
             scene_data.get('target_box') is not None:
+        zoom = scene_data.get('zoom_region')
+        if zoom is not None:
+            return tuple(int(v) for v in zoom)
         box = calculate_crop_box(
             scene_data['target_box'], frame_width, frame_height)
-        return box[0], box[2] - box[0]
-    return 0, frame_width
+        return box[0], 0, box[2] - box[0], frame_height
+    return 0, 0, frame_width, frame_height
 
 
-def interpolate_region(start, end, frame_offset, duration_frames, frame_width):
-    """Ease (x, w) from start to end, keeping the region inside the source.
+def interpolate_region(start, end, frame_offset, duration_frames, frame_width,
+                       frame_height=None):
+    """Ease a region from start to end, keeping it inside the source.
 
-    Width and centre are eased together with smoothstep, so a zoom converges
-    on the subject while it tightens and a pan (equal widths) reduces to the
-    lateral interpolation used since v1.5.
+    Regions are (x, y, w, h); (x, w) pairs are accepted for full-height
+    regions and returned in the same shape. Size and centre are eased
+    together with smoothstep, so a zoom converges on the subject while it
+    tightens and a pan (equal sizes) reduces to the lateral interpolation
+    used since v1.5.
     """
     if duration_frames <= 1:
         eased = 1.0
     else:
         eased = smoothstep(frame_offset / (duration_frames - 1))
-    width = int(round(start[1] + (end[1] - start[1]) * eased))
+    pair = len(start) == 2
+    if pair:
+        start = (start[0], 0, start[1], frame_height or 0)
+        end = (end[0], 0, end[1], frame_height or 0)
+    width = int(round(start[2] + (end[2] - start[2]) * eased))
     width = max(2, min(frame_width, width))
-    start_center = start[0] + start[1] / 2.0
-    end_center = end[0] + end[1] / 2.0
-    center = start_center + (end_center - start_center) * eased
-    x = int(round(center - width / 2.0))
+    start_cx = start[0] + start[2] / 2.0
+    end_cx = end[0] + end[2] / 2.0
+    x = int(round(start_cx + (end_cx - start_cx) * eased - width / 2.0))
     x = max(0, min(frame_width - width, x))
-    return x, width
+    if pair:
+        return x, width
+    height = int(round(start[3] + (end[3] - start[3]) * eased))
+    if frame_height is not None:
+        height = max(2, min(frame_height, height))
+    start_cy = start[1] + start[3] / 2.0
+    end_cy = end[1] + end[3] / 2.0
+    y = int(round(start_cy + (end_cy - start_cy) * eased - height / 2.0))
+    y = max(0, y)
+    if frame_height is not None:
+        y = min(frame_height - height, y)
+    return x, y, width, height
 
 
 def _transition_frames(duration, fps):
@@ -439,7 +518,9 @@ def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
             if previous.get('target_box') is None or \
                     scene.get('target_box') is None:
                 continue
-            if abs(to_region[0] - from_region[0]) < min_pan_distance:
+            same_size = abs(to_region[2] - from_region[2]) < min_pan_distance
+            if same_size and abs(to_region[0] - from_region[0]) < min_pan_distance \
+                    and abs(to_region[1] - from_region[1]) < min_pan_distance:
                 scene['boundary_kind'] = 'hold'
                 continue
             kind = 'pan'
@@ -449,9 +530,13 @@ def plan_pan_transitions(video_path, scenes_analysis, frame_width, frame_height,
         scene['transition'] = {
             'kind': kind,
             'from_x': from_region[0],
-            'from_w': from_region[1],
+            'from_y': from_region[1],
+            'from_w': from_region[2],
+            'from_h': from_region[3],
             'to_x': to_region[0],
-            'to_w': to_region[1],
+            'to_y': to_region[1],
+            'to_w': to_region[2],
+            'to_h': to_region[3],
             'duration_frames': duration,
         }
 
@@ -469,6 +554,7 @@ def summarize_pan_plan(scenes_analysis):
         'hold': 0,
         'layout_switch': 0,
         'speaker_turns': 0,
+        'face_zoom': sum(1 for s in scenes_analysis if s.get('zoom_region')),
     }
     for i in range(1, len(scenes_analysis)):
         previous, current = scenes_analysis[i - 1], scenes_analysis[i]
@@ -507,7 +593,7 @@ def scene_index_for_frame(scenes_analysis, frame_number, current_index=0):
 
 
 def resolve_frame_region(scene_data, frame_number, frame_width, frame_height):
-    """Return the source region (x, w) to show for one frame.
+    """Return the source region (x, y, w, h) to show for one frame.
 
     Single source of truth for per-frame framing. The production encode
     loop, the unit tests, and scripts/pan_lab.py all call this so a
@@ -519,45 +605,59 @@ def resolve_frame_region(scene_data, frame_number, frame_width, frame_height):
         offset = frame_number - scene_data['start_frame']
         if 0 <= offset < transition['duration_frames']:
             region = interpolate_region(
-                (transition['from_x'], transition['from_w']),
-                (transition['to_x'], transition['to_w']),
+                (transition['from_x'], transition.get('from_y', 0),
+                 transition['from_w'], transition.get('from_h', frame_height)),
+                (transition['to_x'], transition.get('to_y', 0),
+                 transition['to_w'], transition.get('to_h', frame_height)),
                 offset,
                 transition['duration_frames'],
                 frame_width,
+                frame_height,
             )
     return region
+
+
+def is_full_frame_region(region, frame_width, frame_height):
+    return region[2] >= frame_width and region[3] >= frame_height
 
 
 def resolve_frame_crop(scene_data, frame_number, frame_width, frame_height):
     """Compatibility view of resolve_frame_region as (label, crop_box).
 
     label is 'LETTERBOX' with crop_box None when the region is the whole
-    frame, otherwise 'TRACK' with a full-height crop box. Mid-zoom frames
-    report 'TRACK' with a box wider than the output aspect ratio.
+    frame, otherwise 'TRACK' with a crop box (x1, y1, x2, y2). Mid-zoom
+    frames report 'TRACK' with a box wider than the output aspect ratio.
     """
-    x, width = resolve_frame_region(
+    region = resolve_frame_region(
         scene_data, frame_number, frame_width, frame_height)
-    if width >= frame_width:
+    if is_full_frame_region(region, frame_width, frame_height):
         return 'LETTERBOX', None
-    return 'TRACK', (x, 0, x + width, frame_height)
+    x, y, width, height = region
+    return 'TRACK', (x, y, x + width, y + height)
 
 
 def render_region(frame, x, width, frame_width, frame_height,
-                  output_width, output_height):
-    """Scale a full-height source region to the output, letterboxing if needed.
+                  output_width, output_height, y=0, height=None):
+    """Scale a source region to the output, letterboxing if needed.
 
-    A region with the output aspect ratio fills the frame (TRACK). A wider
+    A region with the output aspect ratio fills the frame (TRACK, and the
+    tighter face zoom, which is upscaled with bicubic filtering). A wider
     region is scaled to the output width and centred between black bars
     (LETTERBOX, and every intermediate frame of a zoom).
     """
     import cv2
     import numpy as np
-    region = frame[:, x:x + width]
+    if height is None:
+        height = frame_height - y
+    region = frame[y:y + height, x:x + width]
     scale_factor = output_width / width
-    scaled_height = int(frame_height * scale_factor)
+    scaled_height = int(height * scale_factor)
+    interpolation = cv2.INTER_CUBIC if scale_factor > 1.0 else cv2.INTER_AREA
     if scaled_height >= output_height - 1:
-        return cv2.resize(region, (output_width, output_height))
-    scaled = cv2.resize(region, (output_width, scaled_height))
+        return cv2.resize(region, (output_width, output_height),
+                          interpolation=interpolation)
+    scaled = cv2.resize(region, (output_width, scaled_height),
+                        interpolation=interpolation)
     output = np.zeros((output_height, output_width, 3), dtype=np.uint8)
     y_offset = (output_height - scaled_height) // 2
     output[y_offset:y_offset + scaled_height, :] = scaled
@@ -567,14 +667,14 @@ def render_region(frame, x, width, frame_width, frame_height,
 def render_output_frame(frame, scene_data, frame_number, frame_width,
                         frame_height, output_width, output_height):
     """Render one source frame according to the scene plan."""
-    x, width = resolve_frame_region(
+    x, y, width, height = resolve_frame_region(
         scene_data, frame_number, frame_width, frame_height)
     return render_region(frame, x, width, frame_width, frame_height,
-                         output_width, output_height)
+                         output_width, output_height, y=y, height=height)
 
 
 def plan_frame_regions(scenes_analysis, total_frames, frame_width, frame_height):
-    """Per-frame (x, w) source region for the whole plan."""
+    """Per-frame (x, y, w, h) source region for the whole plan."""
     regions = []
     index = 0
     for frame_number in range(total_frames):
@@ -587,8 +687,8 @@ def plan_frame_regions(scenes_analysis, total_frames, frame_width, frame_height)
 def plan_frame_crops(scenes_analysis, total_frames, frame_width, frame_height):
     """Per-frame crop left edge for the whole plan (None for full-frame)."""
     return [
-        None if width >= frame_width else x
-        for x, width in plan_frame_regions(
+        None if is_full_frame_region(region, frame_width, frame_height) else region[0]
+        for region in plan_frame_regions(
             scenes_analysis, total_frames, frame_width, frame_height)
     ]
 
@@ -621,6 +721,8 @@ def serialize_plan(scenes_analysis, frame_width, frame_height, fps, ratio):
                 'transition': plain(s.get('transition')),
                 'people': len(s.get('analysis', [])),
                 'speaker': plain(s.get('speaker')),
+                'focus_face': plain(s.get('focus_face')),
+                'zoom_region': plain(s.get('zoom_region')),
             }
             for s in scenes_analysis
         ],
@@ -962,6 +1064,14 @@ def cli():
     parser.add_argument('--speaker-face-stride', type=int, default=2,
                         help="Run face detection every N frames when tracking speakers "
                              "(default 2). Higher = cheaper, coarser tracks.")
+    parser.add_argument('--face-zoom', type=float, default=0.18,
+                        help="Tighten the crop on small faces so the face is about this "
+                             "fraction of the output height (default 0.18; 0 disables). "
+                             "Applies to faces found by speaker focus; needs "
+                             "--speaker-focus auto.")
+    parser.add_argument('--face-zoom-max-upscale', type=float, default=2.0,
+                        help="Never enlarge the source by more than this factor when "
+                             "zooming on a face (default 2.0), so quality stays acceptable.")
     parser.add_argument('--debug-overlay', type=str, default=None,
                         help="Also write the source video with face tracks, speaker scores "
                              "and the active crop region drawn on, to this path.")
@@ -1121,7 +1231,11 @@ def cli():
             input_video, scenes_analysis, fps, original_height, decide,
             min_dwell_sec=args.speaker_min_dwell,
             face_stride=args.speaker_face_stride,
-            overlap=args.speaker_overlap)
+            overlap=args.speaker_overlap,
+            zoom_faces=args.face_zoom > 0)
+    face_zoom_count = plan_face_zoom(
+        scenes_analysis, original_width, original_height,
+        face_fraction=args.face_zoom, max_upscale=args.face_zoom_max_upscale)
     plan_pan_transitions(
         input_video,
         scenes_analysis,
@@ -1157,6 +1271,11 @@ def cli():
                 motion_str += ", speaker: crosstalk/group"
             elif speaker_info.get('kind') == 'unsplit':
                 motion_str += f", speaker-focus skipped ({speaker_info.get('reason')})"
+        zoom_region = scene_data.get('zoom_region')
+        if zoom_region:
+            motion_str += (f", face-zoom {original_height / zoom_region[3]:.2f}x "
+                           f"(crop {zoom_region[2]}x{zoom_region[3]} at "
+                           f"{zoom_region[0]},{zoom_region[1]})")
         transition_str = ""
         if i > 0:
             boundary = scene_data.get('boundary_kind', 'cut')
@@ -1168,8 +1287,11 @@ def cli():
                     f", {transition['kind']}: {seconds:.2f}s "
                     f"({transition['duration_frames']}f, "
                     f"w {transition['from_w']}->{transition['to_w']}, "
-                    f"x {transition['from_x']}->{transition['to_x']})"
+                    f"x {transition['from_x']}->{transition['to_x']}"
                 )
+                if transition.get('from_h') != transition.get('to_h'):
+                    transition_str += f", h {transition['from_h']}->{transition['to_h']}"
+                transition_str += ")"
         print(f"  - Scene {i+1} ({start_time} -> {end_time}): "
               f"Found {num_people} person(s){motion_str}. Strategy: {strategy}"
               f"{transition_str}")
@@ -1180,6 +1302,7 @@ def cli():
           f"({pan_summary['track_to_track']} TRACK->TRACK boundaries, "
           f"{pan_summary['layout_boundaries']} layout boundaries, "
           f"{pan_summary['speaker_turns']} speaker-turns, "
+          f"{pan_summary['face_zoom']} face-zoom scenes, "
           f"pan-duration {args.pan_duration:.2f}s, zoom-duration {zoom_duration:.2f}s)")
     if pan_summary['track_to_track'] and not pan_summary['pan'] and args.pan_duration > 0:
         print("   ⚠️  No pans planned despite TRACK->TRACK boundaries. Every crop "
